@@ -19,7 +19,7 @@
 
 It’s designed to help you do **quick due diligence**, not to replace your security team (hi security team, please don’t @ me).
 
-> Curious how the score is calculated? See **[CALCULATION.md](./CALCULATION.md)** for the full, spicy breakdown.
+> Curious how the score is calculated? See **[CALCULATION.md](https://github.com/gmartijn/mcp-quality-audit/blob/main/calculation.md))** for the full, spicy breakdown.
 
 ---
 
