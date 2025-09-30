@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# mcp_quality_audit.py
+# mcp_quality_audit.py — 4-level risk version (Low/Medium/High/Critical)
 import argparse
 import csv
 import json
@@ -30,7 +30,7 @@ GH_HEADERS = {"Accept": "application/vnd.github+json"}
 if GITHUB_TOKEN:
     GH_HEADERS["Authorization"] = f"Bearer {GITHUB_TOKEN}"
 
-# Single shared session so we can globally toggle SSL verification
+# Single shared session so we can toggle SSL verification globally
 SESSION = requests.Session()
 
 # ------------------ Defaults ------------------
@@ -42,9 +42,12 @@ DEFAULT_WEIGHTS = {
     "privacy_signal": 0.05,
 }
 
+# Allowed risk labels (4-level scale)
+ALLOWED_RATINGS = ["low", "medium", "high", "critical"]
+
 # thresholds are MINIMUM score → rating; pick the highest min <= score
+# Top level is now "low" (best), then medium, high, critical (worst).
 DEFAULT_RISK_THRESHOLDS = {
-    "very_low": 90,
     "low": 75,
     "medium": 60,
     "high": 40,
@@ -52,11 +55,10 @@ DEFAULT_RISK_THRESHOLDS = {
 }
 
 RATING_STYLES = {
-    "very_low": "green",
-    "low": "chartreuse3",
+    "low": "green",
     "medium": "yellow3",
     "high": "dark_orange",
-    "critical": "red"
+    "critical": "red",
 }
 
 # ------------------ HTTP helpers ------------------
@@ -101,18 +103,30 @@ def resolve_weights(weights_arg: Optional[str], weights_file: Optional[str]) -> 
     return w
 
 def resolve_thresholds(th_arg: Optional[str], th_file: Optional[str]) -> Dict[str, float]:
+    # Start with the 4-level defaults and **only** keep allowed labels
     t = dict(DEFAULT_RISK_THRESHOLDS)
     override = _load_json_str_or_file(th_arg, th_file)
     if isinstance(override, dict):
+        filtered = {}
         for k, v in override.items():
-            try:
-                t[k] = float(v)
-            except Exception:
-                pass
+            k_l = str(k).lower()
+            if k_l in ALLOWED_RATINGS:
+                try:
+                    filtered[k_l] = float(v)
+                except Exception:
+                    pass
+        # Only apply if at least one valid override provided
+        if filtered:
+            t.update(filtered)
+    # Ensure critical exists and is <= others
+    if "critical" not in t:
+        t["critical"] = 0.0
     return t
 
 def rating_from_score(score: float, thresholds: Dict[str, float]) -> str:
-    items = sorted(thresholds.items(), key=lambda kv: kv[1], reverse=True)
+    # Choose label with highest min that is <= score, considering only allowed labels
+    items = [(k, thresholds.get(k, -1e9)) for k in ALLOWED_RATINGS]
+    items = sorted(items, key=lambda kv: kv[1], reverse=True)
     for label, minimum in items:
         if score >= minimum:
             return label
@@ -400,7 +414,7 @@ def print_report(mcp_name: str, registry: str, entry: dict, repo_stats: Dict[str
     style = RATING_STYLES.get(rating, "white")
 
     title = f"[bold]MCP Quality Assessment[/bold]\n[dim]{mcp_name}[/dim]\nRegistry: {registry}"
-    badge = f"[{style}]Risk Rating: {rating.replace('_',' ').title()}[/]  •  Score: {overall}/100"
+    badge = f"[{style}]Risk Rating: {rating.title()}[/]  •  Score: {overall}/100"
     console.print(Panel.fit(f"{title}\n{badge}", border_style="cyan", box=box.ROUNDED))
 
     t = Table(title="Registry Entry", box=box.SIMPLE_HEAVY)
@@ -458,8 +472,9 @@ def print_report(mcp_name: str, registry: str, entry: dict, repo_stats: Dict[str
 
     thr = Table(title="Risk Thresholds (min score → label)", box=box.SIMPLE_HEAVY)
     thr.add_column("Label"); thr.add_column("Min Score")
-    for label, minimum in sorted(thresholds.items(), key=lambda kv: kv[1], reverse=True):
-        thr.add_row(label.replace("_"," ").title(), str(minimum))
+    # show in descending order of min score, filtered to allowed labels
+    for label in sorted(ALLOWED_RATINGS, key=lambda L: thresholds.get(L, -1e9), reverse=True):
+        thr.add_row(label.title(), str(thresholds.get(label)))
     console.print(thr)
 
     checklist = [
@@ -536,9 +551,9 @@ def main():
     ap.add_argument("--csv", type=str, default=None, help="CSV output path (use '-' for stdout) when used with --list")
 
     # configurables
-    ap.add_argument("--weights", type=str, default=None, help="JSON object of scoring weights (keys: publisher_trust, security_posture, maintenance, license, privacy_signal)")
-    ap.add_argument("--weights-file", type=str, default=None, help="Path to JSON file with scoring weights")
-    ap.add_argument("--risk-thresholds", type=str, default=None, help="JSON object mapping label->min score, e.g. {'very_low':90,'low':75,'medium':60,'high':40,'critical':0}")
+    ap.add_argument("--weights", type=str, default=None, help="JSON object of weights (publisher_trust, security_posture, maintenance, license, privacy_signal)")
+    ap.add_argument("--weights-file", type=str, default=None, help="Path to JSON file with weights")
+    ap.add_argument("--risk-thresholds", type=str, default=None, help="JSON object mapping label->min score (allowed: low, medium, high, critical)")
     ap.add_argument("--risk-thresholds-file", type=str, default=None, help="Path to JSON file with risk thresholds")
 
     # networking
@@ -549,7 +564,6 @@ def main():
     # Apply --skipssl setting to the shared session
     if args.skipssl:
         SESSION.verify = False
-        # silence insecure request warnings to avoid noisy output
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     weights = resolve_weights(args.weights, args.weights_file)
@@ -587,6 +601,7 @@ def main():
     print_report(args.name, args.registry, entry, repo_stats, secret_scan, scores, weights, thresholds)
 
     if args.json:
+        overall = overall_from(scores, weights)
         output = {
             "query": args.name,
             "registry": args.registry,
@@ -596,8 +611,8 @@ def main():
             "scores": scores,
             "weights_used": weights,
             "risk": {
-                "score": overall_from(scores, weights),
-                "rating": rating_from_score(overall_from(scores, weights), thresholds),
+                "score": overall,
+                "rating": rating_from_score(overall, thresholds),
                 "thresholds": thresholds
             }
         }
