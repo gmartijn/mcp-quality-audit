@@ -24,7 +24,7 @@ It’s designed to help you do **quick due diligence**, not to replace your secu
 ---
 
 ## Features (now with 17% extra sass)
-- `--list` — Enumerate servers from the MCP Registry (cursor‑based pagination! wow such API)
+- `--list` — Enumerate servers from the MCP Registry (cursor‑based pagination)
 - `--search "<query>"` — Filter server list by keyword
 - `--csv <path|- >` — Export a tidy CSV for spreadsheets and/or questionable pivot tables
 - `--page-size` & `--limit` — You get a page size! You get a page size! Everyone gets a page size!
@@ -36,6 +36,7 @@ It’s designed to help you do **quick due diligence**, not to replace your secu
   - Privacy/GDPR *vibes* (keyword hints in README)
 - **Configurable scoring** via `--weights` / `--weights-file`
 - **Configurable risk thresholds** via `--risk-thresholds` / `--risk-thresholds-file`
+- **Proxy‑friendly networking** via `--skipssl` (skip TLS verification when your corporate proxy does SSL inspection)
 - Pretty terminal output via `rich` **and** `--json` for machines that don’t appreciate dramatic tables
 
 ---
@@ -83,6 +84,16 @@ python mcp_quality_audit.py filesystem --fuzzy
 ```bash
 python mcp_quality_audit.py fetch --fuzzy --json > fetch_audit.json
 ```
+
+### 5) Behind a proxy that does SSL inspection?
+```bash
+# Disable TLS verification for all HTTP(S) calls this script makes
+python mcp_quality_audit.py --list --skipssl
+
+# Fuzzy audit + skip SSL verification
+python mcp_quality_audit.py filesystem --fuzzy --skipssl
+```
+> ⚠️ **Safety note:** `--skipssl` disables certificate verification. Only use it in a trusted network (e.g., corporate proxy with SSL inspection). If you can, prefer installing your proxy’s root CA so you don’t need this flag.
 
 ---
 

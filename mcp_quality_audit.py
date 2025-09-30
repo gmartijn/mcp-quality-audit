@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Tuple
 
 import requests
+import urllib3
 from dateutil import parser as dtparser
 from rich.console import Console
 from rich.table import Table
@@ -28,6 +29,9 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GH_HEADERS = {"Accept": "application/vnd.github+json"}
 if GITHUB_TOKEN:
     GH_HEADERS["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+
+# Single shared session so we can globally toggle SSL verification
+SESSION = requests.Session()
 
 # ------------------ Defaults ------------------
 DEFAULT_WEIGHTS = {
@@ -58,7 +62,7 @@ RATING_STYLES = {
 # ------------------ HTTP helpers ------------------
 def get_json(url: str, headers: Optional[Dict[str, str]] = None, timeout=20, params: Optional[dict]=None) -> Optional[dict]:
     try:
-        r = requests.get(url, headers=headers, timeout=timeout, params=params)
+        r = SESSION.get(url, headers=headers, timeout=timeout, params=params)
         if r.status_code == 200:
             return r.json()
         return None
@@ -100,7 +104,6 @@ def resolve_thresholds(th_arg: Optional[str], th_file: Optional[str]) -> Dict[st
     t = dict(DEFAULT_RISK_THRESHOLDS)
     override = _load_json_str_or_file(th_arg, th_file)
     if isinstance(override, dict):
-        # keep only known labels; allow custom labels but order may be unpredictable
         for k, v in override.items():
             try:
                 t[k] = float(v)
@@ -109,12 +112,10 @@ def resolve_thresholds(th_arg: Optional[str], th_file: Optional[str]) -> Dict[st
     return t
 
 def rating_from_score(score: float, thresholds: Dict[str, float]) -> str:
-    # choose label with highest min that is <= score
     items = sorted(thresholds.items(), key=lambda kv: kv[1], reverse=True)
     for label, minimum in items:
         if score >= minimum:
             return label
-    # fallback
     return "critical"
 
 # ------------------ Registry lookups ------------------
@@ -244,7 +245,7 @@ def github_repo_stats(repo_url: str) -> Dict[str, Any]:
     readme = gh_api(f"/repos/{owner}/{repo}/readme")
     if readme and "download_url" in readme:
         try:
-            txt = requests.get(readme["download_url"], timeout=20).text.lower()
+            txt = SESSION.get(readme["download_url"], timeout=20).text.lower()
             out["gdpr_mentions"] = any(k in txt for k in ("gdpr", "general data protection regulation", "privacy", "data residency", "eu data"))
             out["privacy_policy_linked"] = ("privacy policy" in txt) or ("privacy-policy" in txt)
         except Exception:
@@ -279,7 +280,7 @@ def shallow_secret_scan(repo_url: str, limit_files=50) -> Dict[str, Any]:
         if not blob or "download_url" not in blob:
             continue
         try:
-            txt = requests.get(blob["download_url"], timeout=15).text
+            txt = SESSION.get(blob["download_url"], timeout=15).text
         except Exception:
             continue
         out["scanned_files"] += 1
@@ -540,7 +541,16 @@ def main():
     ap.add_argument("--risk-thresholds", type=str, default=None, help="JSON object mapping label->min score, e.g. {'very_low':90,'low':75,'medium':60,'high':40,'critical':0}")
     ap.add_argument("--risk-thresholds-file", type=str, default=None, help="Path to JSON file with risk thresholds")
 
+    # networking
+    ap.add_argument("--skipssl", action="store_true", help="Skip TLS certificate verification (useful behind SSL-inspecting proxies)")
+
     args = ap.parse_args()
+
+    # Apply --skipssl setting to the shared session
+    if args.skipssl:
+        SESSION.verify = False
+        # silence insecure request warnings to avoid noisy output
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     weights = resolve_weights(args.weights, args.weights_file)
     thresholds = resolve_thresholds(args.risk_thresholds, args.risk_thresholds_file)
@@ -550,7 +560,7 @@ def main():
         servers = list_all_servers(args.registry, limit=args.limit, page_size=args.page_size)
         servers = filter_servers(servers, args.search)
         if not servers:
-            console.print(f("[red]No servers found at {args.registry}[/red]"))
+            console.print(f"[red]No servers found at {args.registry}[/red]")
             sys.exit(2)
         if args.csv:
             export_csv(servers, args.csv)
