@@ -19,7 +19,7 @@
 
 It’s designed to help you do **quick due diligence**, not to replace your security team (hi security team, please don’t @ me).
 
-> Curious how the score is calculated? See **[CALCULATION.md](https://github.com/gmartijn/mcp-quality-audit/blob/main/calculation.md))** for the full, spicy breakdown.
+> Curious how the score is calculated? See **[CALCULATION.md](./CALCULATION.md)** for the full, spicy breakdown.
 
 ---
 
@@ -41,6 +41,98 @@ It’s designed to help you do **quick due diligence**, not to replace your secu
 
 ---
 
+---
+
+---
+
+## Example Output
+
+Here’s a real-world run using **`io.github.p1va/symbols`** (colors trimmed for Markdown).
+
+```text
+╭────────────────────────────────────────────────────╮
+│ MCP Quality Assessment                             │
+│ io.github.p1va/symbols                             │
+│ Registry: https://registry.modelcontextprotocol.io │
+│ Risk Rating: Low  •  Score: 86.2/100               │
+╰────────────────────────────────────────────────────╯
+                                Registry Entry                                 
+                                                                               
+  Field         Value                                                          
+ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 
+  name          io.github.p1va/symbols                                         
+  version       0.0.12                                                         
+  description   MCP server to read, inspect and troubleshoot codebase symbols  
+                                                                               
+                 Publisher Trust                  
+                                                  
+  Check                                   Result  
+ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 
+  Namespace looks verified (DNS/GitHub)   ✅      
+  Registry 'verified' flag                None    
+  GitHub owner type                       User    
+  GitHub org verified (approx.)           None    
+                                                  
+            Declared Capabilities             
+                                              
+  Type         Items                          
+ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 
+  Tools                                       
+  Resources                                   
+  Risk Notes   External network calls likely  
+                                              
+                  Repository & Security                  
+                                                         
+  Metric                Value                            
+ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 
+  repo_url              https://github.com/p1va/symbols  
+  stars                 0                                
+  forks                 0                                
+  open_issues           0                                
+  latest_commit         2025-09-17T14:14:22Z             
+  pushed_at             2025-09-17T14:14:27Z             
+  archived              False                            
+  disabled              False                            
+  homepage                                               
+  security_issue_hits   0                                
+  Secret scan hits      0                                
+                                                         
+           Scores (0–100)            
+                                     
+  Dimension          Score   Weight  
+ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 
+  publisher_trust    85      0.30    
+  security_posture   100     0.30    
+  maintenance        95      0.25    
+  license            40      0.10    
+  privacy_signal     60      0.05    
+  overall            86.2    —       
+                                     
+  Risk Thresholds (min  
+     score → label)     
+                        
+  Label      Min Score  
+ ━━━━━━━━━━━━━━━━━━━━━━ 
+  Very Low   90         
+  Low        75         
+  Medium     60         
+  High       40         
+  Critical   0          
+                        
+                                               Manual Review Needed                                               
+                                                                                                                  
+  Item                             Action                                                                         
+ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 
+  Permissions & scopes alignment   Review tools/resources and any required env vars (MCP has no runtime scopes).  
+  Test in non-prod                 Run server in sandbox; monitor latency/side-effects.                           
+  GDPR compliance                  Confirm personal data processing; DPA if needed.                               
+  Data residency                   Verify storage/processing locations.                                           
+  Privacy policy                   Locate and review publisher’s policy.                                          
+  Support options                  Docs, forums, issue responsiveness, security contact.                          
+  DR/rollback                      Have a rollback plan if workflows break.                                       
+```
+
+## Installation
 ## Installation
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
@@ -101,7 +193,7 @@ python mcp_quality_audit.py filesystem --fuzzy --skipssl
 - We score five areas (0–100): `publisher_trust`, `security_posture`, `maintenance`, `license`, `privacy_signal`.
 - We combine them with weights (defaults: `0.30, 0.30, 0.25, 0.10, 0.05`).
 - That yields an **overall score** (0–100), which maps to a **risk label**.
-- Want the full story? **[Read CALCULATION.md](https://github.com/gmartijn/mcp-quality-audit/blob/main/calculation.md)** — it’s funny *and* educational.
+- Want the full story? **[Read CALCULATION.md](./CALCULATION.md)** — it’s funny *and* educational.
 
 ### Customize the knobs
 ```bash
