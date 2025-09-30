@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-# mcp_quality_audit.py — 4-level risk version (Low/Medium/High/Critical)
+# mcp_quality_audit.py — MCP registry + GitHub audit (integrated metrics, 4-level risk, explainable)
 import argparse
 import csv
 import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
+import random
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, List, Tuple
 
 import requests
 import urllib3
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from dateutil import parser as dtparser
 from rich.console import Console
 from rich.table import Table
@@ -18,6 +21,7 @@ from rich.panel import Panel
 from rich import box
 
 console = Console()
+console_err = Console(stderr=True)
 
 # ------------------ Registry API ------------------
 DEFAULT_REGISTRY = "https://registry.modelcontextprotocol.io"
@@ -25,13 +29,41 @@ API_PREFIX = "/v0"
 PATH_SERVERS = f"{API_PREFIX}/servers"
 
 # ------------------ GitHub API ------------------
+API_BASE = os.getenv("GITHUB_API_BASE", "https://api.github.com")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GH_HEADERS = {"Accept": "application/vnd.github+json"}
+
+GH_HEADERS = {
+    "Accept": "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+    "User-Agent": "mcp-quality-audit/1.3"
+}
 if GITHUB_TOKEN:
     GH_HEADERS["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+else:
+    console_err.print("[yellow]Warning: No GITHUB_TOKEN set; you may hit rate limits quickly.[/yellow]")
 
-# Single shared session so we can toggle SSL verification globally
+# Single shared session so we can toggle SSL verification globally + retries
 SESSION = requests.Session()
+
+# Add retrying + default timeouts to the session
+DEFAULT_TIMEOUT = 20  # seconds
+class _TimeoutAdapter(HTTPAdapter):
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("max_retries", Retry(
+            total=3,
+            backoff_factor=0.6,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["GET", "HEAD", "OPTIONS"]),
+            raise_on_status=False,
+        ))
+        super().__init__(*args, **kwargs)
+    def send(self, request, **kwargs):
+        kwargs.setdefault("timeout", DEFAULT_TIMEOUT)
+        return super().send(request, **kwargs)
+
+SESSION.headers.update(GH_HEADERS)
+SESSION.mount("https://", _TimeoutAdapter())
+SESSION.mount("http://", _TimeoutAdapter())
 
 # ------------------ Defaults ------------------
 DEFAULT_WEIGHTS = {
@@ -46,7 +78,6 @@ DEFAULT_WEIGHTS = {
 ALLOWED_RATINGS = ["low", "medium", "high", "critical"]
 
 # thresholds are MINIMUM score → rating; pick the highest min <= score
-# Top level is now "low" (best), then medium, high, critical (worst).
 DEFAULT_RISK_THRESHOLDS = {
     "low": 75,
     "medium": 60,
@@ -62,9 +93,21 @@ RATING_STYLES = {
 }
 
 # ------------------ HTTP helpers ------------------
-def get_json(url: str, headers: Optional[Dict[str, str]] = None, timeout=20, params: Optional[dict]=None) -> Optional[dict]:
+def get_json(url: str, headers: Optional[Dict[str, str]] = None, timeout=DEFAULT_TIMEOUT, params: Optional[dict]=None) -> Optional[dict]:
     try:
         r = SESSION.get(url, headers=headers, timeout=timeout, params=params)
+        # surface GH ratelimit
+        if "api.github.com" in url and r.status_code == 403 and r.headers.get("X-RateLimit-Remaining") == "0":
+            reset = r.headers.get("X-RateLimit-Reset")
+            when = ""
+            try:
+                if reset:
+                    ts = datetime.utcfromtimestamp(int(reset)).strftime("%Y-%m-%d %H:%M:%S UTC")
+                    when = f" until {ts}"
+            except Exception:
+                pass
+            console_err.print(f"[yellow]GitHub rate limit exceeded{when}. Set GITHUB_TOKEN or retry later.[/yellow]")
+            return None
         if r.status_code == 200:
             return r.json()
         return None
@@ -79,31 +122,32 @@ def _load_json_str_or_file(s: Optional[str], path: Optional[str]) -> Optional[di
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except Exception as e:
-            console.print(f"[red]Failed to load JSON file[/red] {path}: {e}")
+            console_err.print(f"[red]Failed to load JSON file[/red] {path}: {e}")
     elif s:
         try:
             data = json.loads(s)
         except Exception as e:
-            console.print(f"[red]Failed to parse JSON string[/red]: {e}")
+            console_err.print(f"[red]Failed to parse JSON string[/red]: {e}")
     return data
 
 def resolve_weights(weights_arg: Optional[str], weights_file: Optional[str]) -> Dict[str, float]:
     w = dict(DEFAULT_WEIGHTS)
     override = _load_json_str_or_file(weights_arg, weights_file)
     if isinstance(override, dict):
+        for k in override.keys():
+            if k not in DEFAULT_WEIGHTS:
+                console_err.print(f"[yellow]Ignoring unknown weight key: {k}[/yellow]")
         w.update({k: float(v) for k, v in override.items() if k in DEFAULT_WEIGHTS})
-    # normalize if needed
     s = sum(w.values())
     if s <= 0:
         w = dict(DEFAULT_WEIGHTS)
         s = sum(w.values())
     if abs(s - 1.0) > 1e-6:
         w = {k: v / s for k, v in w.items()}
-        console.print("[dim]Weights normalized to sum to 1.0[/dim]")
+        console_err.print("[dim]Weights normalized to sum to 1.0[/dim]")
     return w
 
 def resolve_thresholds(th_arg: Optional[str], th_file: Optional[str]) -> Dict[str, float]:
-    # Start with the 4-level defaults and **only** keep allowed labels
     t = dict(DEFAULT_RISK_THRESHOLDS)
     override = _load_json_str_or_file(th_arg, th_file)
     if isinstance(override, dict):
@@ -115,16 +159,17 @@ def resolve_thresholds(th_arg: Optional[str], th_file: Optional[str]) -> Dict[st
                     filtered[k_l] = float(v)
                 except Exception:
                     pass
-        # Only apply if at least one valid override provided
         if filtered:
             t.update(filtered)
-    # Ensure critical exists and is <= others
     if "critical" not in t:
         t["critical"] = 0.0
+    ordered = ["low", "medium", "high", "critical"]
+    mins = [t.get(k, 0) for k in ordered]
+    if not all(x >= y for x, y in zip(mins, mins[1:])):
+        console_err.print("[yellow]Warning: risk thresholds are non-monotonic; results may be surprising.[/yellow]")
     return t
 
 def rating_from_score(score: float, thresholds: Dict[str, float]) -> str:
-    # Choose label with highest min that is <= score, considering only allowed labels
     items = [(k, thresholds.get(k, -1e9)) for k in ALLOWED_RATINGS]
     items = sorted(items, key=lambda kv: kv[1], reverse=True)
     for label, minimum in items:
@@ -158,7 +203,7 @@ def try_registry_lookup(registry: str, mcp_name: str, fuzzy: bool) -> Tuple[Opti
     items, _ = _extract_items_and_next(payload)
     best = None
     def name_of(x):
-        return x.get("name") or x.get("id") or x.get("slug") or x.get("full_name")
+        return x.get("name") or x.get("id") or x.get("slug") or x.get("namespace") or x.get("full_name")
     for x in items:
         if name_of(x) == mcp_name:
             best = x
@@ -219,7 +264,7 @@ def extract_repo_url(entry: dict) -> Optional[str]:
     return None
 
 def gh_api(path: str) -> Optional[dict]:
-    return get_json("https://api.github.com" + path, headers=GH_HEADERS)
+    return get_json(API_BASE + path, headers=GH_HEADERS)
 
 def parse_github_owner_repo(url: str) -> Optional[Tuple[str, str]]:
     m = re.search(r"github\.com/([^/]+)/([^/#]+)", url or "")
@@ -227,40 +272,135 @@ def parse_github_owner_repo(url: str) -> Optional[Tuple[str, str]]:
         return None
     return m.group(1), m.group(2).replace(".git", "")
 
-def github_repo_stats(repo_url: str) -> Dict[str, Any]:
+def github_repo_stats(repo_url: str, *, max_commits: int = 500, no_deps: bool = False) -> Dict[str, Any]:
     out = {"repo_url": repo_url}
     parsed = parse_github_owner_repo(repo_url)
     if not parsed:
         return out
     owner, repo = parsed
+
     repo_data = gh_api(f"/repos/{owner}/{repo}") or {}
-    out["stars"] = repo_data.get("stargazers_count")
-    out["forks"] = repo_data.get("forks_count")
-    out["open_issues"] = repo_data.get("open_issues_count")
-    out["license"] = (repo_data.get("license") or {}).get("spdx_id")
-    out["pushed_at"] = repo_data.get("pushed_at")
-    out["updated_at"] = repo_data.get("updated_at")
-    out["archived"] = repo_data.get("archived")
-    out["disabled"] = repo_data.get("disabled")
-    out["homepage"] = repo_data.get("homepage")
+    out.update({
+        "stars": repo_data.get("stargazers_count"),
+        "forks": repo_data.get("forks_count"),
+        "open_issues": repo_data.get("open_issues_count"),
+        "license": (repo_data.get("license") or {}).get("spdx_id"),
+        "pushed_at": repo_data.get("pushed_at"),
+        "updated_at": repo_data.get("updated_at"),
+        "archived": repo_data.get("archived"),
+        "disabled": repo_data.get("disabled"),
+        "homepage": repo_data.get("homepage"),
+        "language": repo_data.get("language"),
+        "has_issues": repo_data.get("has_issues"),
+        "default_branch": repo_data.get("default_branch") or "HEAD",
+    })
 
     owner_data = gh_api(f"/users/{owner}") or {}
-    out["owner_type"] = owner_data.get("type")
-    out["org_is_verified_guess"] = owner_data.get("is_verified")
+    out.update({
+        "owner_type": owner_data.get("type"),
+        "org_is_verified_guess": owner_data.get("is_verified"),
+    })
+
+    commits = gh_api(f"/repos/{owner}/{repo}/commits?sha={out['default_branch']}&per_page=1")
+    if isinstance(commits, list) and commits:
+        out["latest_commit"] = (commits[0].get("commit", {}).get("committer", {}) or {}).get("date")
+
+    def _looks_bot(login: Optional[str]) -> bool:
+        if not login: return False
+        l = login.lower()
+        return l.endswith("[bot]") or l.endswith("-bot") or l.startswith("bot-")
+
+    since_iso = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat().replace("+00:00", "Z")
+    devs = set()
+    page = 1
+    while True:
+        page_commits = gh_api(f"/repos/{owner}/{repo}/commits?since={since_iso}&per_page=100&page={page}")
+        if not isinstance(page_commits, list) or not page_commits:
+            break
+        for c in page_commits:
+            for who in ("author","committer"):
+                user = c.get(who) or {}
+                login = user.get("login")
+                if login and not _looks_bot(login):
+                    devs.add(login)
+        page += 1
+        if page > 10:
+            break
+    out["active_devs_90d"] = len(devs)
+
+    def _has_path(path: str) -> bool:
+        resp = gh_api(f"/repos/{owner}/{repo}/contents/{path}")
+        return bool(resp and resp.get("download_url"))
+    out["has_security_md"] = any(_has_path(p) for p in (".github/SECURITY.md","SECURITY.md","docs/SECURITY.md"))
+
+    signed, total = 0, 0
+    page = 1
+    while total < max_commits:
+        batch = gh_api(f"/repos/{owner}/{repo}/commits?per_page=100&page={page}")
+        if not isinstance(batch, list) or not batch:
+            break
+        for c in batch:
+            if total >= max_commits:
+                break
+            ver = (c.get("commit") or {}).get("verification") or {}
+            if ver.get("verified"):
+                signed += 1
+            total += 1
+        page += 1
+    out["signed_commits"] = signed
+    out["signed_commits_sampled"] = total
+    out["signed_commits_ratio"] = (signed / total) if total else None
+
+    if not no_deps:
+        sbom = gh_api(f"/repos/{owner}/{repo}/dependency-graph/sbom") or {}
+        status = sbom.get("message")
+        if sbom and "sbom" in sbom:
+            out["dep_graph_enabled"] = True
+            packages = (sbom.get("sbom") or {}).get("packages") or []
+            out["sbom_package_count"] = len(packages)
+        elif status == "Accepted":
+            out["dep_graph_enabled"] = True
+            out["sbom_package_count"] = None
+        else:
+            out["dep_graph_enabled"] = False
+            out["sbom_package_count"] = None
+
+        severities = {"critical": 0, "high": 0, "medium": 0, "low": 0, "none": 0}
+        page = 1
+        total_alerts = 0
+        while True:
+            alerts = gh_api(f"/repos/{owner}/{repo}/dependabot/alerts?state=open&per_page=100&page={page}")
+            if alerts is None:
+                total_alerts = None
+                severities = None
+                break
+            if not isinstance(alerts, list) or not alerts:
+                break
+            for a in alerts:
+                sev = ((a.get("security_vulnerability") or {}).get("severity") or "none").lower()
+                if sev not in severities:
+                    sev = "none"
+                severities[sev] += 1
+                total_alerts += 1
+            if len(alerts) < 100:
+                break
+            page += 1
+        out["dependabot_alerts_total"] = total_alerts
+        out["dependabot_alerts_by_severity"] = severities
+    else:
+        out["dep_graph_enabled"] = None
+        out["sbom_package_count"] = None
+        out["dependabot_alerts_total"] = None
+        out["dependabot_alerts_by_severity"] = None
 
     issues = gh_api(f"/search/issues?q=repo:{owner}/{repo}+security+in:title,body") or {}
     out["security_issue_hits"] = issues.get("total_count")
-
-    commits = gh_api(f"/repos/{owner}/{repo}/commits")
-    if isinstance(commits, list) and commits:
-        latest = commits[0].get("commit", {}).get("committer", {}).get("date")
-        out["latest_commit"] = latest
 
     readme = gh_api(f"/repos/{owner}/{repo}/readme")
     if readme and "download_url" in readme:
         try:
             txt = SESSION.get(readme["download_url"], timeout=20).text.lower()
-            out["gdpr_mentions"] = any(k in txt for k in ("gdpr", "general data protection regulation", "privacy", "data residency", "eu data"))
+            out["gdpr_mentions"] = any(k in txt for k in ("gdpr","general data protection regulation","privacy","data residency","eu data"))
             out["privacy_policy_linked"] = ("privacy policy" in txt) or ("privacy-policy" in txt)
         except Exception:
             pass
@@ -268,27 +408,33 @@ def github_repo_stats(repo_url: str) -> Dict[str, Any]:
     return out
 
 SECRET_SMELLS = [
-    r"AKIA[0-9A-Z]{16}",                       # AWS key
+    r"AKIA[0-9A-Z]{16}",
     r"-----BEGIN (RSA|EC|DSA) PRIVATE KEY-----",
     r"api[_-]?key\s*=\s*['\"][A-Za-z0-9_\-]{16,}['\"]",
     r"secret\s*=\s*['\"][A-Za-z0-9_\-]{16,}['\"]",
     r"x-api-key\s*:\s*[A-Za-z0-9_\-]{16,}",
-    r"ghp_[A-Za-z0-9]{36,}",                   # GitHub token
+    r"ghp_[A-Za-z0-9]{36,}",
 ]
 
 def shallow_secret_scan(repo_url: str, limit_files=50) -> Dict[str, Any]:
-    out = {"scanned_files": 0, "hits": []}
+    out = {"scanned_files": 0, "hits": [], "truncated": False}
     parsed = parse_github_owner_repo(repo_url)
     if not parsed:
         return out
     owner, repo = parsed
-    tree = gh_api(f"/repos/{owner}/{repo}/git/trees/HEAD?recursive=1")
+    meta = gh_api(f"/repos/{owner}/{repo}") or {}
+    branch = meta.get("default_branch") or "HEAD"
+    tree = gh_api(f"/repos/{owner}/{repo}/git/trees/{branch}?recursive=1")
     if not tree or "tree" not in tree:
         return out
     files = [t for t in tree["tree"] if t.get("type") == "blob"]
+    out["truncated"] = bool(tree.get("truncated"))
     sample = [f for f in files if not f["path"].lower().endswith((
         ".png",".jpg",".jpeg",".gif",".pdf",".zip",".gz",".jar",".exe",".dll",".webp",".svg"
-    ))][:limit_files]
+    ))]
+    random.seed(f"{owner}/{repo}")
+    random.shuffle(sample)
+    sample = sample[:limit_files]
     for f in sample:
         blob = gh_api(f"/repos/{owner}/{repo}/contents/{f['path']}")
         if not blob or "download_url" not in blob:
@@ -304,64 +450,213 @@ def shallow_secret_scan(repo_url: str, limit_files=50) -> Dict[str, Any]:
     return out
 
 # ------------------ Scoring / reporting ------------------
-def calc_scores(entry: dict, repo_stats: Dict[str, Any], secret_scan: Dict[str, Any]) -> Dict[str, Any]:
-    scores = {}
+def calc_scores(entry: dict, repo_stats: Dict[str, Any], secret_scan: Dict[str, Any], *, explain: bool=False) -> Tuple[Dict[str, Any], Optional[dict]]:
+    """
+    Return (scores_dict, explanation_dict|None).
+    Scores integrate richer GitHub metrics into the 5-dimension model.
+    """
+    def clamp(x: float) -> float:
+        return max(0.0, min(100.0, x))
 
+    POPULAR_LANGS = {
+        "python", "javascript", "typescript", "go", "rust",
+        "java", "c#", "kotlin", "swift"
+    }
+
+    explanation = {
+        "publisher_trust": {"steps": []},
+        "maintenance": {"steps": []},
+        "license": {"steps": []},
+        "privacy_signal": {"steps": []},
+        "security_posture": {"steps": []},
+        "overall": {},
+        "rating": {}
+    } if explain else None
+
+    scores: Dict[str, float] = {}
+
+    # Publisher trust
+    base_pt = 70.0
+    pt = base_pt
+    if explain: explanation["publisher_trust"]["steps"].append({"reason": "Base", "value": base_pt})
     ns = entry.get("namespace") or entry.get("name") or entry.get("id") or ""
     explicit_verified = entry.get("verified") or entry.get("publisher_verified") or entry.get("is_verified")
-    verified = bool(explicit_verified) or ns.startswith("io.github.") or re.match(r"([a-z0-9-]+\.)+[a-z]{2,}/", ns)
-    org_verified = True if repo_stats.get("org_is_verified_guess") else False
-    pub_score = 70 + (15 if verified else 0) + (15 if org_verified else 0)
-    scores["publisher_trust"] = min(pub_score, 100)
+    namespace_verified = bool(explicit_verified) or ns.startswith("io.github.") or re.match(r"([a-z0-9-]+\.)+[a-z]{2,}/", ns)
+    if namespace_verified:
+        pt += 15
+        if explain: explanation["publisher_trust"]["steps"].append({"reason": "Namespace/registry verified", "delta": +15})
+    if repo_stats.get("org_is_verified_guess"):
+        pt += 15
+        if explain: explanation["publisher_trust"]["steps"].append({"reason": "GitHub org verified", "delta": +15})
+    pt = clamp(pt)
+    scores["publisher_trust"] = pt
+    if explain: explanation["publisher_trust"]["final"] = pt
 
-    sec_hits = int(repo_stats.get("security_issue_hits") or 0)
-    secret_hits = len(secret_scan.get("hits") or [])
-    sec_score = 100
-    if sec_hits >= 3:
-        sec_score -= 30
-    elif sec_hits == 2:
-        sec_score -= 20
-    elif sec_hits == 1:
-        sec_score -= 10
-    if secret_hits > 0:
-        sec_score = max(sec_score - 50, 10)
-    scores["security_posture"] = max(min(sec_score, 100), 0)
-
+    # Maintenance
+    if explain: explanation["maintenance"]["steps"].append({"reason": "Base from recency buckets"})
     latest = repo_stats.get("latest_commit") or repo_stats.get("pushed_at") or repo_stats.get("updated_at")
-    maint_score = 50
+    days = None
     if latest:
         try:
             dt = dtparser.parse(latest)
             days = (datetime.now(timezone.utc) - dt).days
-            if days <= 30:
-                maint_score = 95
-            elif days <= 90:
-                maint_score = 80
-            elif days <= 180:
-                maint_score = 65
-            elif days <= 365:
-                maint_score = 55
-            else:
-                maint_score = 35
         except Exception:
             pass
-    scores["maintenance"] = maint_score
+    if days is None:
+        maint = 35
+        if explain: explanation["maintenance"]["steps"].append({"reason": "No recent commit info", "value": 35})
+    elif days <= 30:
+        maint = 95
+        if explain: explanation["maintenance"]["steps"].append({"reason": "Latest commit ≤30 days", "value": 95})
+    elif days <= 90:
+        maint = 80
+        if explain: explanation["maintenance"]["steps"].append({"reason": "Latest commit ≤90 days", "value": 80})
+    elif days <= 180:
+        maint = 65
+        if explain: explanation["maintenance"]["steps"].append({"reason": "Latest commit ≤180 days", "value": 65})
+    elif days <= 365:
+        maint = 55
+        if explain: explanation["maintenance"]["steps"].append({"reason": "Latest commit ≤365 days", "value": 55})
+    else:
+        maint = 35
+        if explain: explanation["maintenance"]["steps"].append({"reason": "Latest commit >365 days", "value": 35})
 
+    devs = int(repo_stats.get("active_devs_90d") or 0)
+    if devs >= 10:
+        maint += 10
+        if explain: explanation["maintenance"]["steps"].append({"reason": "Active devs ≥10 (90d)", "delta": +10})
+    elif devs >= 5:
+        maint += 5
+        if explain: explanation["maintenance"]["steps"].append({"reason": "Active devs ≥5 (90d)", "delta": +5})
+    elif devs == 0 and (days is not None and days > 180):
+        maint -= 10
+        if explain: explanation["maintenance"]["steps"].append({"reason": "0 active devs & stale >180d", "delta": -10})
+
+    if repo_stats.get("has_issues") is True:
+        maint += 3
+        if explain: explanation["maintenance"]["steps"].append({"reason": "Issue tracking enabled", "delta": +3})
+    elif repo_stats.get("has_issues") is False:
+        maint -= 5
+        if explain: explanation["maintenance"]["steps"].append({"reason": "Issue tracking disabled", "delta": -5})
+
+    lang = (repo_stats.get("language") or "").strip().lower()
+    if lang in POPULAR_LANGS:
+        maint += 3
+        if explain: explanation["maintenance"]["steps"].append({"reason": f"Popular language: {lang}", "delta": +3})
+
+    if repo_stats.get("archived") or repo_stats.get("disabled"):
+        old_maint = maint
+        maint = min(maint, 20)
+        if explain: explanation["maintenance"]["steps"].append({"reason": "Archived/disabled: cap to ≤20", "from": old_maint, "to": maint})
+
+    maint = clamp(maint)
+    scores["maintenance"] = maint
+    if explain: explanation["maintenance"]["final"] = maint
+
+    # License
     lic = (repo_stats.get("license") or "").upper()
     if lic in {"MIT","APACHE-2.0","BSD-2-CLAUSE","BSD-3-CLAUSE","MPL-2.0"}:
         lic_score = 100
+        rule = f"{lic or 'permissive family'} → 100"
     elif lic in {"GPL-3.0","AGPL-3.0","LGPL-3.0"}:
         lic_score = 75
+        rule = f"{lic} → 75"
     elif lic:
         lic_score = 70
+        rule = f"{lic} (other) → 70"
     else:
         lic_score = 40
+        rule = "No license → 40"
+    lic_score = clamp(lic_score)
     scores["license"] = lic_score
+    if explain:
+        explanation["license"]["steps"].append({"reason": "License rule", "value": rule})
+        explanation["license"]["final"] = lic_score
 
+    # Privacy
     gdpr = bool(repo_stats.get("gdpr_mentions"))
-    scores["privacy_signal"] = 85 if gdpr else 60
+    privacy_url_hint = bool(str(repo_stats.get("homepage") or "").lower().find("privacy") != -1)
+    if gdpr:
+        pr = 85
+        why = "README mentions GDPR/privacy/data residency"
+    elif privacy_url_hint or repo_stats.get("privacy_policy_linked"):
+        pr = 70
+        why = "Privacy policy hinted/linked"
+    else:
+        pr = 60
+        why = "No explicit privacy signals"
+    pr = clamp(pr)
+    scores["privacy_signal"] = pr
+    if explain:
+        explanation["privacy_signal"]["steps"].append({"reason": why, "value": pr})
+        explanation["privacy_signal"]["final"] = pr
 
-    return scores
+    # Security posture
+    sec = 100.0
+    if explain: explanation["security_posture"]["steps"].append({"reason": "Base", "value": 100})
+
+    sec_hits = int(repo_stats.get("security_issue_hits") or 0)
+    if sec_hits >= 3:
+        sec -= 10; eff=-10
+    elif sec_hits == 2:
+        sec -= 6; eff=-6
+    elif sec_hits == 1:
+        sec -= 3; eff=-3
+    else:
+        eff = 0
+    if explain and eff:
+        explanation["security_posture"]["steps"].append({"reason": "Security keyword issue hits", "delta": eff, "hits": sec_hits})
+
+    secret_hits = len(secret_scan.get("hits") or [])
+    if secret_hits > 0:
+        sec -= 40
+        if explain: explanation["security_posture"]["steps"].append({"reason": "Secret scan hits", "delta": -40, "matches": secret_hits})
+
+    if repo_stats.get("has_security_md"):
+        sec += 5
+        if explain: explanation["security_posture"]["steps"].append({"reason": "SECURITY.md present", "delta": +5})
+
+    scr = repo_stats.get("signed_commits_ratio")
+    if isinstance(scr, (int, float)):
+        if scr >= 0.75:
+            sec += 6; add = +6
+        elif scr >= 0.5:
+            sec += 3; add = +3
+        else:
+            add = 0
+        if explain and add:
+            explanation["security_posture"]["steps"].append({"reason": "Signed commits ratio", "delta": add, "ratio": round(scr, 3)})
+
+    sev = repo_stats.get("dependabot_alerts_by_severity")
+    if isinstance(sev, dict):
+        penalty = ((sev.get("critical",0)*4.0) + (sev.get("high",0)*2.0) +
+                   (sev.get("medium",0)*1.0) + (sev.get("low",0)*0.5))
+        penalty = min(penalty, 30.0)
+        if penalty:
+            sec -= penalty
+            if explain:
+                explanation["security_posture"]["steps"].append({
+                    "reason": "Dependabot open alerts penalty (clamped ≤30)",
+                    "delta": -penalty,
+                    "by_severity": {k:int(v) for k,v in sev.items()}
+                })
+
+    if repo_stats.get("dep_graph_enabled") is True:
+        sec += 4
+        if explain: explanation["security_posture"]["steps"].append({"reason": "Dependency graph enabled", "delta": +4})
+        if isinstance(repo_stats.get("sbom_package_count"), int) and repo_stats.get("sbom_package_count") > 0:
+            sec += 2
+            if explain: explanation["security_posture"]["steps"].append({"reason": "SBOM packages present", "delta": +2})
+
+    if repo_stats.get("archived") or repo_stats.get("disabled"):
+        sec -= 10
+        if explain: explanation["security_posture"]["steps"].append({"reason": "Archived/disabled", "delta": -10})
+
+    sec = clamp(sec)
+    scores["security_posture"] = sec
+    if explain: explanation["security_posture"]["final"] = sec
+
+    return scores, explanation
 
 def overall_from(scores: Dict[str, float], weights: Dict[str, float]) -> float:
     total = 0.0
@@ -408,10 +703,13 @@ def summarize_tools_resources(entry: dict) -> Tuple[List[str], List[str], List[s
         risk.append("Likely requires API tokens/secrets")
     return tools, resources, risk
 
-def print_report(mcp_name: str, registry: str, entry: dict, repo_stats: Dict[str, Any], secret_scan: Dict[str, Any], scores: Dict[str, Any], weights: Dict[str, float], thresholds: Dict[str, float]):
+def print_report(mcp_name: str, registry: str, entry: dict, repo_stats: Dict[str, Any], secret_scan: Dict[str, Any], scores: Dict[str, Any], weights: Dict[str, float], thresholds: Dict[str, float], *, json_mode: bool = False, suppress_scores: bool = False, suppress_thresholds: bool = False):
     overall = overall_from(scores, weights)
     rating = rating_from_score(overall, thresholds)
     style = RATING_STYLES.get(rating, "white")
+
+    if json_mode:
+        return
 
     title = f"[bold]MCP Quality Assessment[/bold]\n[dim]{mcp_name}[/dim]\nRegistry: {registry}"
     badge = f"[{style}]Risk Rating: {rating.title()}[/]  •  Score: {overall}/100"
@@ -463,19 +761,50 @@ def print_report(mcp_name: str, registry: str, entry: dict, repo_stats: Dict[str
                 subt.add_row(h["path"], h["pattern"])
             console.print(subt)
 
-    st = Table(title="Scores (0–100)", box=box.SIMPLE_HEAVY)
-    st.add_column("Dimension"); st.add_column("Score"); st.add_column("Weight")
-    for k in ("publisher_trust","security_posture","maintenance","license","privacy_signal"):
-        st.add_row(k, str(scores[k]), f"{weights.get(k,0):.2f}")
-    st.add_row("overall", f"{overall}", "—")
-    console.print(st)
+        enrich = Table(title="Enhanced GitHub Signals", box=box.SIMPLE_HEAVY)
+        enrich.add_column("Metric"); enrich.add_column("Value")
 
-    thr = Table(title="Risk Thresholds (min score → label)", box=box.SIMPLE_HEAVY)
-    thr.add_column("Label"); thr.add_column("Min Score")
-    # show in descending order of min score, filtered to allowed labels
-    for label in sorted(ALLOWED_RATINGS, key=lambda L: thresholds.get(L, -1e9), reverse=True):
-        thr.add_row(label.title(), str(thresholds.get(label)))
-    console.print(thr)
+        def _add_if(k, label=None, fmt=str):
+            v = repo_stats.get(k)
+            if v is not None:
+                try:
+                    val = fmt(v)
+                except Exception:
+                    val = v
+                enrich.add_row(label or k, str(val))
+
+        _add_if("default_branch", "default_branch")
+        _add_if("language", "language")
+        _add_if("has_issues", "issue_tracking_enabled")
+        _add_if("active_devs_90d", "active_devs_last_90_days", int)
+        _add_if("has_security_md", "security_policy_present", lambda x: "Yes" if x else "No")
+        if repo_stats.get("signed_commits_sampled"):
+            ratio = repo_stats.get("signed_commits_ratio")
+            enrich.add_row("signed_commits", f"{repo_stats.get('signed_commits')}/{repo_stats.get('signed_commits_sampled')} ({ratio:.2%})")
+        if repo_stats.get("dep_graph_enabled") is not None:
+            enrich.add_row("dependency_graph_enabled", "Yes" if repo_stats.get("dep_graph_enabled") else "No")
+            if repo_stats.get("sbom_package_count") is not None:
+                enrich.add_row("sbom_package_count", str(repo_stats.get("sbom_package_count")))
+        if isinstance(repo_stats.get("dependabot_alerts_by_severity"), dict):
+            sev = repo_stats["dependabot_alerts_by_severity"]
+            enrich.add_row("dependabot_alerts_total", str(repo_stats.get("dependabot_alerts_total")))
+            enrich.add_row("dependabot_by_severity", f"crit:{sev.get('critical',0)} high:{sev.get('high',0)} med:{sev.get('medium',0)} low:{sev.get('low',0)}")
+        console.print(enrich)
+
+    if not suppress_scores:
+        st = Table(title="Scores (0–100)", box=box.SIMPLE_HEAVY)
+        st.add_column("Dimension"); st.add_column("Score"); st.add_column("Weight")
+        for k in ("publisher_trust","security_posture","maintenance","license","privacy_signal"):
+            st.add_row(k, str(scores[k]), f"{weights.get(k,0):.2f}")
+        st.add_row("overall", f"{overall}", "—")
+        console.print(st)
+
+    if not suppress_thresholds:
+        thr = Table(title="Risk Thresholds (min score → label)", box=box.SIMPLE_HEAVY)
+        thr.add_column("Label"); thr.add_column("Min Score")
+        for label in sorted(ALLOWED_RATINGS, key=lambda L: thresholds.get(L, -1e9), reverse=True):
+            thr.add_row(label.title(), str(thresholds.get(label)))
+        console.print(thr)
 
     checklist = [
         ("Permissions & scopes alignment", "Review tools/resources and any required env vars (MCP has no runtime scopes)."),
@@ -485,12 +814,75 @@ def print_report(mcp_name: str, registry: str, entry: dict, repo_stats: Dict[str
         ("Privacy policy", "Locate and review publisher’s policy."),
         ("Support options", "Docs, forums, issue responsiveness, security contact."),
         ("DR/rollback", "Have a rollback plan if workflows break."),
+        ("Security policy", "If missing SECURITY.md, ask publisher for contact & vulnerability disclosure process."),
+        ("Signed commits", "If ratio <50%, consider requiring verified signing for critical repos."),
+        ("Dependencies", "If dep graph disabled, request enablement; review SBOM if available."),
+        ("Vulnerabilities", "Triage Dependabot alerts; prioritize Critical/High."),
     ]
     ct = Table(title="Manual Review Needed", box=box.SIMPLE_HEAVY)
     ct.add_column("Item"); ct.add_column("Action")
     for a,b in checklist:
         ct.add_row(a,b)
     console.print(ct)
+
+def print_step_by_step_explanation(explanation: dict, weights: Dict[str, float], thresholds: Dict[str, float], scores: Dict[str, float]):
+    # Weighted contributions
+    contrib = []
+    total = 0.0
+    for k in ("publisher_trust","security_posture","maintenance","license","privacy_signal"):
+        w = float(weights.get(k,0.0))
+        s = float(scores.get(k,0.0))
+        prod = round(w*s, 3)
+        contrib.append((k, s, w, prod))
+        total += prod
+    total = round(total, 1)
+
+    console.print(Panel.fit("[bold]Risk Calculation — Step by Step[/bold]", border_style="magenta", box=box.ROUNDED))
+
+    def section(title: str, steps: List[dict], final: float):
+        t = Table(title=title, box=box.SIMPLE_HEAVY)
+        t.add_column("Step/Reason", style="bold")
+        t.add_column("Effect / Value", overflow="fold")
+        for s in steps:
+            if "delta" in s:
+                t.add_row(str(s.get("reason")), f"{s['delta']:+} {json.dumps({k:v for k,v in s.items() if k not in ('reason','delta')}) if len(s)>2 else ''}".strip())
+            elif "from" in s and "to" in s:
+                t.add_row(str(s.get("reason")), f"{s['from']} → {s['to']}")
+            elif "value" in s:
+                t.add_row(str(s.get("reason")), str(s["value"]))
+            else:
+                t.add_row(str(s.get("reason")), json.dumps({k:v for k,v in s.items() if k!='reason'}))
+        t.add_row("—", f"Final: {final}")
+        console.print(t)
+
+    # Per-dimension explanation
+    for dim, title in [
+        ("publisher_trust","Publisher Trust"),
+        ("maintenance","Maintenance"),
+        ("license","License"),
+        ("privacy_signal","Privacy"),
+        ("security_posture","Security Posture"),
+    ]:
+        sec = explanation.get(dim, {})
+        section(title, sec.get("steps", []), sec.get("final"))
+
+    # Weighted contributions
+    wt = Table(title="Weighted Contributions → Overall", box=box.SIMPLE_HEAVY)
+    wt.add_column("Dimension"); wt.add_column("Score"); wt.add_column("Weight"); wt.add_column("Contribution (w*score)")
+    for (k,s,w,p) in contrib:
+        wt.add_row(k, str(s), f"{w:.2f}", str(p))
+    wt.add_row("—","—","—", f"{total}")
+    console.print(wt)
+
+    # Threshold mapping
+    ordered = sorted(ALLOWED_RATINGS, key=lambda L: thresholds.get(L, -1e9), reverse=True)
+    th = Table(title="Risk Label Mapping", box=box.SIMPLE_HEAVY)
+    th.add_column("Label"); th.add_column("Min Score"); th.add_column("Meets?")
+    for lab in ordered:
+        minv = thresholds.get(lab, 0.0)
+        meets = "Yes" if total >= minv else "No"
+        th.add_row(lab.title(), str(minv), meets)
+    console.print(th)
 
 # ------------------ CSV & list printing ------------------
 def print_server_list(servers: List[dict], json_out: bool = False):
@@ -537,11 +929,12 @@ def export_csv(servers: List[dict], path: str):
 
 # ------------------ CLI ------------------
 def main():
-    ap = argparse.ArgumentParser(description="MCP quality audit from registry + GitHub signals")
+    ap = argparse.ArgumentParser(description="MCP quality audit from registry + GitHub signals (integrated metrics, explainable)")
     ap.add_argument("name", nargs="?", help="MCP name (e.g., com.example/my-mcp). Use --fuzzy to search by keyword.")
     ap.add_argument("--registry", default=DEFAULT_REGISTRY, help="MCP registry base URL")
     ap.add_argument("--fuzzy", action="store_true", help="Search instead of exact lookup")
     ap.add_argument("--json", action="store_true", help="Output machine-readable JSON")
+    ap.add_argument("--explain-risk", action="store_true", help="Show step-by-step explanation of the risk level calculation and suppress the standard scores/thresholds tables")
 
     # listing
     ap.add_argument("--list", action="store_true", help="List MCP servers and exit")
@@ -559,17 +952,21 @@ def main():
     # networking
     ap.add_argument("--skipssl", action="store_true", help="Skip TLS certificate verification (useful behind SSL-inspecting proxies)")
 
+    # extra GitHub options
+    ap.add_argument("--no-deps", action="store_true", help="Skip dependency graph + Dependabot vulnerability checks")
+    ap.add_argument("--max-commits", type=int, default=500, help="Maximum commits to sample for signed-commit ratio (default: 500)")
+    ap.add_argument("--no-secret-scan", action="store_true", help="Skip shallow secret scan of repo contents")
+
     args = ap.parse_args()
 
-    # Apply --skipssl setting to the shared session
     if args.skipssl:
         SESSION.verify = False
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        console_err.print("[yellow]TLS verification disabled (--skipssl). Use with caution.[/yellow]")
 
     weights = resolve_weights(args.weights, args.weights_file)
     thresholds = resolve_thresholds(args.risk_thresholds, args.risk_thresholds_file)
 
-    # Handle --list first
     if args.list:
         servers = list_all_servers(args.registry, limit=args.limit, page_size=args.page_size)
         servers = filter_servers(servers, args.search)
@@ -594,11 +991,26 @@ def main():
         sys.exit(2)
 
     repo_url = extract_repo_url(entry)
-    repo_stats = github_repo_stats(repo_url) if repo_url else {}
-    secret_scan = shallow_secret_scan(repo_url) if repo_url else {"scanned_files": 0, "hits": []}
-    scores = calc_scores(entry, repo_stats, secret_scan)
+    repo_stats = {}
+    secret_scan = {"scanned_files": 0, "hits": []}
+    if repo_url:
+        repo_stats = github_repo_stats(repo_url, max_commits=args.max_commits, no_deps=args.no_deps)
+        if not args.no_secret_scan:
+            secret_scan = shallow_secret_scan(repo_url)
 
-    print_report(args.name, args.registry, entry, repo_stats, secret_scan, scores, weights, thresholds)
+    scores, explanation = calc_scores(entry, repo_stats, secret_scan, explain=args.explain_risk)
+
+    # Human-readable report
+    print_report(
+        args.name, args.registry, entry, repo_stats, secret_scan, scores, weights, thresholds,
+        json_mode=args.json,
+        suppress_scores=args.explain_risk,           # hide default scores table in explain mode
+        suppress_thresholds=args.explain_risk        # hide thresholds table in explain mode
+    )
+
+    # Step-by-step explanation (if requested and not JSON)
+    if args.explain_risk and not args.json and explanation:
+        print_step_by_step_explanation(explanation, weights, thresholds, scores)
 
     if args.json:
         overall = overall_from(scores, weights)
@@ -614,7 +1026,8 @@ def main():
                 "score": overall,
                 "rating": rating_from_score(overall, thresholds),
                 "thresholds": thresholds
-            }
+            },
+            "explanation": explanation if args.explain_risk else None
         }
         print(json.dumps(output, indent=2))
 
