@@ -10,12 +10,16 @@
 - Talks to the **official MCP Registry** (`/v0/servers`) to discover servers
 - Peeks at linked **GitHub repos** for vibes data (license, commits, issues)
 - Does a **light secret sniff** (no shame, just regex)
-- Rolls everything up into a **quality score** so you can decide if an MCP server is:
-  - 🟢 “Ship it”  
-  - 🟡 “Maybe. In a sandbox. With a helmet.”  
-  - 🔴 “Absolutely not. Block it with a firewall and holy water.”
+- Rolls everything up into a **quality score** *and* a **risk rating**
+  - 🟢 “Very Low”
+  - 🟡 “Low”
+  - 🟠 “Medium”
+  - 🟧 “High”
+  - 🔴 “Critical”
 
 It’s designed to help you do **quick due diligence**, not to replace your security team (hi security team, please don’t @ me).
+
+> Curious how the score is calculated? See **[CALCULATION.md](./CALCULATION.md)** for the full, spicy breakdown.
 
 ---
 
@@ -24,12 +28,14 @@ It’s designed to help you do **quick due diligence**, not to replace your secu
 - `--search "<query>"` — Filter server list by keyword
 - `--csv <path|- >` — Export a tidy CSV for spreadsheets and/or questionable pivot tables
 - `--page-size` & `--limit` — You get a page size! You get a page size! Everyone gets a page size!
-- Single‑server audit with **evidence‑based** signals:
+- **Single‑server audit** with **evidence‑based** signals:
   - Publisher trust (namespace + GitHub org hints)
   - Security posture (security issue hits + secret smells)
   - Maintenance (freshness of commits)
   - License sanity check
   - Privacy/GDPR *vibes* (keyword hints in README)
+- **Configurable scoring** via `--weights` / `--weights-file`
+- **Configurable risk thresholds** via `--risk-thresholds` / `--risk-thresholds-file`
 - Pretty terminal output via `rich` **and** `--json` for machines that don’t appreciate dramatic tables
 
 ---
@@ -80,49 +86,21 @@ python mcp_quality_audit.py fetch --fuzzy --json > fetch_audit.json
 
 ---
 
-## Scoring (a.k.a. “The Sorting Hat, but for MCPs”)
-Each dimension gets 0–100, then we compute a tasteful weighted average:
+## Scoring & Risk Rating (the tiny version)
+- We score five areas (0–100): `publisher_trust`, `security_posture`, `maintenance`, `license`, `privacy_signal`.
+- We combine them with weights (defaults: `0.30, 0.30, 0.25, 0.10, 0.05`).
+- That yields an **overall score** (0–100), which maps to a **risk label**.
+- Want the full story? **[Read CALCULATION.md](./CALCULATION.md)** — it’s funny *and* educational.
 
-- **Publisher Trust (30%)** — Registry verification hints + GitHub org vibes  
-- **Security Posture (30%)** — Security issue hits + secret smell penalties  
-- **Maintenance (25%)** — Latest commit recency (fresh code smells better)  
-- **License (10%)** — MIT/Apache/BSD/MPL get full points; everything else gets “it depends”  
-- **Privacy Signal (5%)** — README keywords like “privacy”, “GDPR”, “EU data”
+### Customize the knobs
+```bash
+# Adjust weights (normalized if they don't sum to 1)
+python mcp_quality_audit.py filesystem --fuzzy \
+  --weights '{"publisher_trust":0.25,"security_posture":0.35,"maintenance":0.25,"license":0.10,"privacy_signal":0.05}'
 
-> This is a **heuristic**. It’s here to *start* the conversation, not finish it. Bring humans. Preferably caffeinated ones.
-
----
-
-## What this tool actually checks
-- ✅ **Registry**: `/v0/servers`, supports `limit` & `cursor` (no trailing slash)
-- ✅ **GitHub repo**: stars, forks, open issues, license, latest commit
-- ✅ **Security signals**: searches for “security”/“CVE” in issues (best‑effort)
-- ✅ **Secret sniff**: simple regex pass over a small sample of repo files
-- ✅ **Privacy vibes**: README keyword scan
-
-### What it does **not** do
-- ❌ Replace SAST/DAST/SCA (please don’t fire your scanners)
-- ❌ Prove GDPR compliance (you still need lawyers and/or a deep sigh)
-- ❌ Guarantee safety (if you figure out how, call me immediately)
-
----
-
-## CLI Reference (abridged but adorable)
-```text
-mcp_quality_audit.py [NAME] [flags]
-
-Positional:
-  NAME                MCP server id or name (use --fuzzy for loose matching)
-
-Flags:
-  --list              List servers (and exit)
-  --search QUERY      Filter when using --list
-  --limit N           Max items to list (default: 200)
-  --page-size N       Per-page size for registry calls (max 100)
-  --csv PATH          Export CSV (use '-' for stdout) with --list
-  --registry URL      MCP registry base (default: https://registry.modelcontextprotocol.io)
-  --fuzzy             Fuzzy search when auditing a single NAME
-  --json              Also print JSON blob (great for pipelines)
+# Adjust thresholds (min score for each label)
+python mcp_quality_audit.py fetch --fuzzy \
+  --risk-thresholds '{"very_low":90,"low":75,"medium":60,"high":40,"critical":0}'
 ```
 
 ---
@@ -135,7 +113,7 @@ Flags:
 
 ## Tips & Tricks
 - Set `GITHUB_TOKEN` to avoid rate‑limit grumpiness.
-- For super‑large listings: `--limit 1000 --page-size 100`
+- For big listings: `--limit 1000 --page-size 100`
 - CSV + jq + xsv = ✨ data wrangling magic ✨
 - Think an MCP looks suspicious? **Test in a sandbox.** If it breaks things,
   congrats: you’ve done science.
