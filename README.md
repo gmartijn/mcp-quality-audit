@@ -90,7 +90,7 @@ python mcp_quality_audit.py fetch --fuzzy --json > fetch_audit.json
 - We score five areas (0–100): `publisher_trust`, `security_posture`, `maintenance`, `license`, `privacy_signal`.
 - We combine them with weights (defaults: `0.30, 0.30, 0.25, 0.10, 0.05`).
 - That yields an **overall score** (0–100), which maps to a **risk label**.
-- Want the full story? **[Read CALCULATION.md](./CALCULATION.md)** — it’s funny *and* educational.
+- Want the full story? **[Read CALCULATION.md](https://github.com/gmartijn/mcp-quality-audit/blob/main/calculation.md)** — it’s funny *and* educational.
 
 ### Customize the knobs
 ```bash
