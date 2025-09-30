@@ -1,0 +1,7 @@
+{
+  "publisher_trust": 0.25,
+  "security_posture": 0.40,
+  "maintenance": 0.20,
+  "license": 0.10,
+  "privacy_signal": 0.05
+}

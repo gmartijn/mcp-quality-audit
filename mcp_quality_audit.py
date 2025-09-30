@@ -29,6 +29,32 @@ GH_HEADERS = {"Accept": "application/vnd.github+json"}
 if GITHUB_TOKEN:
     GH_HEADERS["Authorization"] = f"Bearer {GITHUB_TOKEN}"
 
+# ------------------ Defaults ------------------
+DEFAULT_WEIGHTS = {
+    "publisher_trust": 0.30,
+    "security_posture": 0.30,
+    "maintenance": 0.25,
+    "license": 0.10,
+    "privacy_signal": 0.05,
+}
+
+# thresholds are MINIMUM score → rating; pick the highest min <= score
+DEFAULT_RISK_THRESHOLDS = {
+    "very_low": 90,
+    "low": 75,
+    "medium": 60,
+    "high": 40,
+    "critical": 0
+}
+
+RATING_STYLES = {
+    "very_low": "green",
+    "low": "chartreuse3",
+    "medium": "yellow3",
+    "high": "dark_orange",
+    "critical": "red"
+}
+
 # ------------------ HTTP helpers ------------------
 def get_json(url: str, headers: Optional[Dict[str, str]] = None, timeout=20, params: Optional[dict]=None) -> Optional[dict]:
     try:
@@ -39,17 +65,60 @@ def get_json(url: str, headers: Optional[Dict[str, str]] = None, timeout=20, par
     except Exception:
         return None
 
+# ------------------ Config helpers ------------------
+def _load_json_str_or_file(s: Optional[str], path: Optional[str]) -> Optional[dict]:
+    data = None
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            console.print(f"[red]Failed to load JSON file[/red] {path}: {e}")
+    elif s:
+        try:
+            data = json.loads(s)
+        except Exception as e:
+            console.print(f"[red]Failed to parse JSON string[/red]: {e}")
+    return data
+
+def resolve_weights(weights_arg: Optional[str], weights_file: Optional[str]) -> Dict[str, float]:
+    w = dict(DEFAULT_WEIGHTS)
+    override = _load_json_str_or_file(weights_arg, weights_file)
+    if isinstance(override, dict):
+        w.update({k: float(v) for k, v in override.items() if k in DEFAULT_WEIGHTS})
+    # normalize if needed
+    s = sum(w.values())
+    if s <= 0:
+        w = dict(DEFAULT_WEIGHTS)
+        s = sum(w.values())
+    if abs(s - 1.0) > 1e-6:
+        w = {k: v / s for k, v in w.items()}
+        console.print("[dim]Weights normalized to sum to 1.0[/dim]")
+    return w
+
+def resolve_thresholds(th_arg: Optional[str], th_file: Optional[str]) -> Dict[str, float]:
+    t = dict(DEFAULT_RISK_THRESHOLDS)
+    override = _load_json_str_or_file(th_arg, th_file)
+    if isinstance(override, dict):
+        # keep only known labels; allow custom labels but order may be unpredictable
+        for k, v in override.items():
+            try:
+                t[k] = float(v)
+            except Exception:
+                pass
+    return t
+
+def rating_from_score(score: float, thresholds: Dict[str, float]) -> str:
+    # choose label with highest min that is <= score
+    items = sorted(thresholds.items(), key=lambda kv: kv[1], reverse=True)
+    for label, minimum in items:
+        if score >= minimum:
+            return label
+    # fallback
+    return "critical"
+
 # ------------------ Registry lookups ------------------
 def _extract_items_and_next(payload: Any) -> Tuple[List[dict], Optional[str]]:
-    """
-    Normalize registry list responses.
-
-    Official example:
-    {
-      "servers": [...],
-      "metadata": {"next_cursor": "abc", "count": 30}
-    }
-    """
     if not isinstance(payload, dict):
         return [], None
     items = payload.get("servers") or payload.get("items") or payload.get("results") or payload.get("data") or []
@@ -66,25 +135,15 @@ def _extract_items_and_next(payload: Any) -> Tuple[List[dict], Optional[str]]:
     return items, nxt
 
 def try_registry_lookup(registry: str, mcp_name: str, fuzzy: bool) -> Tuple[Optional[dict], List[dict]]:
-    """
-    Use official /v0 endpoints.
-      - Exact: GET /v0/servers/{id}
-      - Fuzzy: GET /v0/servers?search=<query>&limit=50
-    """
     base = registry.rstrip("/")
-    # exact by ID
     data = get_json(f"{base}{PATH_SERVERS}/{mcp_name}")
     if isinstance(data, dict) and data:
         return data, [data]
-
-    # fuzzy/search
     payload = get_json(f"{base}{PATH_SERVERS}", params={"search": mcp_name, "limit": 50})
     items, _ = _extract_items_and_next(payload)
     best = None
-
     def name_of(x):
         return x.get("name") or x.get("id") or x.get("slug") or x.get("full_name")
-
     for x in items:
         if name_of(x) == mcp_name:
             best = x
@@ -94,15 +153,9 @@ def try_registry_lookup(registry: str, mcp_name: str, fuzzy: bool) -> Tuple[Opti
     return best, items or []
 
 def list_all_servers(registry: str, limit: int = 200, page_size: int = 100) -> List[dict]:
-    """
-    Cursor-based enumeration of /v0/servers.
-      - limit: max total items to return
-      - page_size: 'limit' query param per page (max 100)
-    """
     base = registry.rstrip("/")
     results: List[dict] = []
     cursor = None
-
     while len(results) < limit:
         params = {"limit": min(page_size, 100)}
         if cursor:
@@ -114,7 +167,6 @@ def list_all_servers(registry: str, limit: int = 200, page_size: int = 100) -> L
         results.extend(items)
         if not cursor:
             break
-
     return results[:limit]
 
 def filter_servers(servers: List[dict], query: Optional[str]) -> List[dict]:
@@ -140,9 +192,10 @@ def extract_repo_url(entry: dict) -> Optional[str]:
                 if isinstance(vv, str) and "github.com" in vv:
                     return vv
     meta = entry.get("_meta") or entry.get("metadata") or {}
-    for _, v in (meta.items() if isinstance(meta, dict) else []):
-        if isinstance(v, str) and "github.com" in v:
-            return v
+    if isinstance(meta, dict):
+        for _, v in meta.items():
+            if isinstance(v, str) and "github.com" in v:
+                return v
     pkgs = entry.get("packages") or []
     for p in pkgs:
         src = p.get("source") or p.get("url")
@@ -293,15 +346,14 @@ def calc_scores(entry: dict, repo_stats: Dict[str, Any], secret_scan: Dict[str, 
     gdpr = bool(repo_stats.get("gdpr_mentions"))
     scores["privacy_signal"] = 85 if gdpr else 60
 
-    overall = (
-        0.30 * scores["publisher_trust"] +
-        0.30 * scores["security_posture"] +
-        0.25 * scores["maintenance"] +
-        0.10 * scores["license"] +
-        0.05 * scores["privacy_signal"]
-    )
-    scores["overall"] = round(overall, 1)
     return scores
+
+def overall_from(scores: Dict[str, float], weights: Dict[str, float]) -> float:
+    total = 0.0
+    for k, v in scores.items():
+        w = float(weights.get(k, 0.0))
+        total += w * float(v)
+    return round(total, 1)
 
 def bool_emoji(v: Optional[bool]) -> str:
     return "✅" if v else "❓" if v is None else "❌"
@@ -341,8 +393,14 @@ def summarize_tools_resources(entry: dict) -> Tuple[List[str], List[str], List[s
         risk.append("Likely requires API tokens/secrets")
     return tools, resources, risk
 
-def print_report(mcp_name: str, registry: str, entry: dict, repo_stats: Dict[str, Any], secret_scan: Dict[str, Any], scores: Dict[str, Any]):
-    console.print(Panel.fit(f"[bold]MCP Quality Assessment[/bold]\n[dim]{mcp_name}[/dim]\nRegistry: {registry}", border_style="cyan", box=box.ROUNDED))
+def print_report(mcp_name: str, registry: str, entry: dict, repo_stats: Dict[str, Any], secret_scan: Dict[str, Any], scores: Dict[str, Any], weights: Dict[str, float], thresholds: Dict[str, float]):
+    overall = overall_from(scores, weights)
+    rating = rating_from_score(overall, thresholds)
+    style = RATING_STYLES.get(rating, "white")
+
+    title = f"[bold]MCP Quality Assessment[/bold]\n[dim]{mcp_name}[/dim]\nRegistry: {registry}"
+    badge = f"[{style}]Risk Rating: {rating.replace('_',' ').title()}[/]  •  Score: {overall}/100"
+    console.print(Panel.fit(f"{title}\n{badge}", border_style="cyan", box=box.ROUNDED))
 
     t = Table(title="Registry Entry", box=box.SIMPLE_HEAVY)
     t.add_column("Field"); t.add_column("Value")
@@ -391,10 +449,17 @@ def print_report(mcp_name: str, registry: str, entry: dict, repo_stats: Dict[str
             console.print(subt)
 
     st = Table(title="Scores (0–100)", box=box.SIMPLE_HEAVY)
-    st.add_column("Dimension"); st.add_column("Score")
-    for k in ("publisher_trust","security_posture","maintenance","license","privacy_signal","overall"):
-        st.add_row(k, str(scores[k]))
+    st.add_column("Dimension"); st.add_column("Score"); st.add_column("Weight")
+    for k in ("publisher_trust","security_posture","maintenance","license","privacy_signal"):
+        st.add_row(k, str(scores[k]), f"{weights.get(k,0):.2f}")
+    st.add_row("overall", f"{overall}", "—")
     console.print(st)
+
+    thr = Table(title="Risk Thresholds (min score → label)", box=box.SIMPLE_HEAVY)
+    thr.add_column("Label"); thr.add_column("Min Score")
+    for label, minimum in sorted(thresholds.items(), key=lambda kv: kv[1], reverse=True):
+        thr.add_row(label.replace("_"," ").title(), str(minimum))
+    console.print(thr)
 
     checklist = [
         ("Permissions & scopes alignment", "Review tools/resources and any required env vars (MCP has no runtime scopes)."),
@@ -411,6 +476,7 @@ def print_report(mcp_name: str, registry: str, entry: dict, repo_stats: Dict[str
         ct.add_row(a,b)
     console.print(ct)
 
+# ------------------ CSV & list printing ------------------
 def print_server_list(servers: List[dict], json_out: bool = False):
     if json_out:
         print(json.dumps(servers, indent=2))
@@ -431,7 +497,6 @@ def print_server_list(servers: List[dict], json_out: bool = False):
     console.print(t)
 
 def export_csv(servers: List[dict], path: str):
-    """Write a CSV with lightweight registry fields (no GitHub calls)."""
     cols = ["name_or_id", "namespace", "version", "publisher", "repo", "verified"]
     close_file = True
     if path == "-":
@@ -461,19 +526,31 @@ def main():
     ap.add_argument("--registry", default=DEFAULT_REGISTRY, help="MCP registry base URL")
     ap.add_argument("--fuzzy", action="store_true", help="Search instead of exact lookup")
     ap.add_argument("--json", action="store_true", help="Output machine-readable JSON")
+
+    # listing
     ap.add_argument("--list", action="store_true", help="List MCP servers and exit")
     ap.add_argument("--limit", type=int, default=200, help="Max number of servers to list with --list (default: 200)")
     ap.add_argument("--page-size", type=int, default=100, help="Per-page limit for registry calls (max 100)")
     ap.add_argument("--search", type=str, default=None, help="Filter listed servers by keyword")
     ap.add_argument("--csv", type=str, default=None, help="CSV output path (use '-' for stdout) when used with --list")
+
+    # configurables
+    ap.add_argument("--weights", type=str, default=None, help="JSON object of scoring weights (keys: publisher_trust, security_posture, maintenance, license, privacy_signal)")
+    ap.add_argument("--weights-file", type=str, default=None, help="Path to JSON file with scoring weights")
+    ap.add_argument("--risk-thresholds", type=str, default=None, help="JSON object mapping label->min score, e.g. {'very_low':90,'low':75,'medium':60,'high':40,'critical':0}")
+    ap.add_argument("--risk-thresholds-file", type=str, default=None, help="Path to JSON file with risk thresholds")
+
     args = ap.parse_args()
+
+    weights = resolve_weights(args.weights, args.weights_file)
+    thresholds = resolve_thresholds(args.risk_thresholds, args.risk_thresholds_file)
 
     # Handle --list first
     if args.list:
         servers = list_all_servers(args.registry, limit=args.limit, page_size=args.page_size)
         servers = filter_servers(servers, args.search)
         if not servers:
-            console.print(f"[red]No servers found at {args.registry}[/red]")
+            console.print(f("[red]No servers found at {args.registry}[/red]"))
             sys.exit(2)
         if args.csv:
             export_csv(servers, args.csv)
@@ -497,7 +574,7 @@ def main():
     secret_scan = shallow_secret_scan(repo_url) if repo_url else {"scanned_files": 0, "hits": []}
     scores = calc_scores(entry, repo_stats, secret_scan)
 
-    print_report(args.name, args.registry, entry, repo_stats, secret_scan, scores)
+    print_report(args.name, args.registry, entry, repo_stats, secret_scan, scores, weights, thresholds)
 
     if args.json:
         output = {
@@ -507,6 +584,12 @@ def main():
             "repo_stats": repo_stats,
             "secret_scan": secret_scan,
             "scores": scores,
+            "weights_used": weights,
+            "risk": {
+                "score": overall_from(scores, weights),
+                "rating": rating_from_score(overall_from(scores, weights), thresholds),
+                "thresholds": thresholds
+            }
         }
         print(json.dumps(output, indent=2))
 

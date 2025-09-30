@@ -1,0 +1,7 @@
+{
+  "very_low": 90,
+  "low": 75,
+  "medium": 60,
+  "high": 45,
+  "critical": 0
+}
