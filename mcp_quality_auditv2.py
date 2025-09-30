@@ -23,6 +23,14 @@ from rich import box
 console = Console()
 console_err = Console(stderr=True)
 
+# Optional PDF/report deps
+try:
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+except Exception:
+    plt = None
+    PdfPages = None
+
 # ------------------ Registry API ------------------
 DEFAULT_REGISTRY = "https://registry.modelcontextprotocol.io"
 API_PREFIX = "/v0"
@@ -922,6 +930,109 @@ def print_step_by_step_explanation(explanation: dict, weights: Dict[str, float],
         th.add_row(lab.title(), str(minv), meets)
     console.print(th)
 
+# ------------------ PDF report ------------------
+def generate_pdf_report(pdf_path: str, mcp_name: str, registry: str, entry: dict, repo_stats: Dict[str, Any], secret_scan: Dict[str, Any], scores: Dict[str, Any], weights: Dict[str, float], thresholds: Dict[str, float]):
+    if PdfPages is None or plt is None:
+        console_err.print("[red]matplotlib is not installed. Unable to generate PDF.[/red] Try: pip3 install matplotlib")
+        return
+
+    overall = overall_from(scores, weights)
+    rating = rating_from_score(overall, thresholds)
+    rating_colors = {"low": "#2ca02c", "medium": "#ffbf00", "high": "#ff7f0e", "critical": "#d62728"}
+    dims = [
+        ("publisher_trust", "Publisher Trust"),
+        ("security_posture", "Security"),
+        ("maintenance", "Maintenance"),
+        ("license", "License"),
+        ("privacy_signal", "Privacy"),
+    ]
+    values = [float(scores.get(k, 0.0)) for k, _ in dims]
+
+    try:
+        with PdfPages(pdf_path) as pdf:
+            # Page 1: Summary and details
+            fig1 = plt.figure(figsize=(8.5, 11), dpi=150)
+            fig1.subplots_adjust(left=0.08, right=0.92, top=0.92, bottom=0.08)
+            ax1 = fig1.add_subplot(111)
+            ax1.axis("off")
+
+            # Title
+            title = f"MCP Quality Assessment\n{mcp_name}"
+            subtitle = f"Registry: {registry}"
+            ax1.text(0.5, 0.96, title, ha="center", va="top", fontsize=18, fontweight="bold")
+            ax1.text(0.5, 0.92, subtitle, ha="center", va="top", fontsize=10, color="#555")
+
+            # Rating badge
+            badge = f"Risk Rating: {rating.title()}  •  Score: {overall}/100"
+            ax1.text(0.5, 0.87, badge, ha="center", va="top", fontsize=12, color="white",
+                     bbox=dict(boxstyle="round,pad=0.5", fc=rating_colors.get(rating, "#444"), ec="none"))
+
+            # Registry entry fields
+            y = 0.82
+            ax1.text(0.05, y, "Registry Entry", fontsize=12, fontweight="bold"); y -= 0.02
+            for k in ("name","id","namespace","version","description","publisher","homepage","website"):
+                v = entry.get(k)
+                if v:
+                    ax1.text(0.06, y, f"{k}: ", fontsize=10, fontweight="bold")
+                    ax1.text(0.18, y, str(v), fontsize=10)
+                    y -= 0.018
+
+            # Repo and security signals
+            y -= 0.01
+            ax1.text(0.05, y, "Repository & Security", fontsize=12, fontweight="bold"); y -= 0.02
+            if repo_stats.get("repo_url"):
+                for k in ("repo_url","license","stars","forks","open_issues","latest_commit","pushed_at","archived","disabled","homepage","security_issue_hits"):
+                    if repo_stats.get(k) is not None:
+                        ax1.text(0.06, y, f"{k}: ", fontsize=10, fontweight="bold")
+                        ax1.text(0.24, y, str(repo_stats.get(k)), fontsize=10)
+                        y -= 0.018
+                hits = secret_scan.get("hits") or []
+                ax1.text(0.06, y, "secret_scan_hits: ", fontsize=10, fontweight="bold")
+                ax1.text(0.24, y, str(len(hits)), fontsize=10); y -= 0.02
+
+            # Scores and weights
+            y -= 0.01
+            ax1.text(0.05, y, "Scores", fontsize=12, fontweight="bold"); y -= 0.02
+            for k, label in dims:
+                ax1.text(0.06, y, f"{label}:", fontsize=10, fontweight="bold")
+                ax1.text(0.24, y, f"{scores.get(k, 0):.1f}", fontsize=10)
+                ax1.text(0.36, y, f"(w={weights.get(k,0):.2f})", fontsize=9, color="#555")
+                y -= 0.018
+            ax1.text(0.06, y, "overall:", fontsize=10, fontweight="bold")
+            ax1.text(0.24, y, f"{overall:.1f}", fontsize=10); y -= 0.02
+
+            # Thresholds
+            y -= 0.01
+            ax1.text(0.05, y, "Risk Thresholds (min score → label)", fontsize=12, fontweight="bold"); y -= 0.02
+            for lab in sorted(ALLOWED_RATINGS, key=lambda L: thresholds.get(L, -1e9), reverse=True):
+                ax1.text(0.06, y, f"{lab.title()}: ", fontsize=10, fontweight="bold")
+                ax1.text(0.24, y, str(thresholds.get(lab)), fontsize=10)
+                y -= 0.018
+
+            pdf.savefig(fig1)
+            plt.close(fig1)
+
+            # Page 2: Heatmap
+            fig2 = plt.figure(figsize=(8.5, 3.5), dpi=150)
+            ax2 = fig2.add_subplot(111)
+            data = [values]  # 1 x N heatmap
+            im = ax2.imshow(data, aspect="auto", cmap="RdYlGn", vmin=0, vmax=100)
+            ax2.set_yticks([])
+            ax2.set_xticks(range(len(dims)))
+            ax2.set_xticklabels([label for _, label in dims], rotation=30, ha="right")
+            for i, v in enumerate(values):
+                ax2.text(i, 0, f"{int(round(v))}", ha="center", va="center", color="black", fontsize=12, fontweight="bold")
+            cbar = fig2.colorbar(im, ax=ax2, orientation="vertical", fraction=0.046, pad=0.04)
+            cbar.set_label("Score (0–100)")
+
+            fig2.suptitle(f"Risk Heatmap — Overall: {overall}/100 ({rating.title()})", fontsize=14, fontweight="bold", color=rating_colors.get(rating, "#222"))
+            pdf.savefig(fig2)
+            plt.close(fig2)
+
+        console.print(f"[green]PDF report written to[/green] {pdf_path}")
+    except Exception as e:
+        console_err.print(f"[red]Failed to write PDF[/red] {pdf_path}: {e}")
+
 # ------------------ CSV & list printing ------------------
 def print_server_list(servers: List[dict], json_out: bool = False):
     if json_out:
@@ -993,14 +1104,14 @@ def main():
     ap.add_argument("--fuzzy", action="store_true", help="Search instead of exact lookup")
     ap.add_argument("--json", action="store_true", help="Output machine-readable JSON")
     ap.add_argument("--explain-risk", action="store_true", help="Show step-by-step explanation of the risk level calculation and suppress the standard scores/thresholds tables")
-
     # listing
     ap.add_argument("--list", action="store_true", help="List MCP servers and exit")
     ap.add_argument("--limit", type=int, default=200, help="Max number of servers to list with --list (default: 200)")
     ap.add_argument("--page-size", type=int, default=100, help="Per-page limit for registry calls (max 100)")
     ap.add_argument("--search", type=str, default=None, help="Filter listed servers by keyword")
     ap.add_argument("--csv", type=str, default=None, help="CSV output path (use '-' for stdout) when used with --list")
-
+    # PDF report
+    ap.add_argument("--pdf", type=str, default=None, help="Write a PDF report to the specified file (single server mode)")
     # configurables
     ap.add_argument("--weights", type=str, default=None, help="JSON object of weights (publisher_trust, security_posture, maintenance, license, privacy_signal)")
     ap.add_argument("--weights-file", type=str, default=None, help="Path to JSON file with weights")
@@ -1026,6 +1137,9 @@ def main():
     thresholds = resolve_thresholds(args.risk_thresholds, args.risk_thresholds_file)
 
     if args.list:
+        if args.pdf:
+            console_err.print("[red]--pdf is not supported with --list. Generate a PDF for a single server query.[/red]")
+            sys.exit(2)
         servers = list_all_servers(args.registry, limit=args.limit, page_size=args.page_size)
         servers = filter_servers(servers, args.search)
         if not servers:
@@ -1062,13 +1176,17 @@ def main():
     print_report(
         args.name, args.registry, entry, repo_stats, secret_scan, scores, weights, thresholds,
         json_mode=args.json,
-        suppress_scores=args.explain_risk,           # hide default scores table in explain mode
-        suppress_thresholds=args.explain_risk        # hide thresholds table in explain mode
+        suppress_scores=args.explain_risk,
+        suppress_thresholds=args.explain_risk
     )
 
     # Step-by-step explanation (if requested and not JSON)
     if args.explain_risk and not args.json and explanation:
         print_step_by_step_explanation(explanation, weights, thresholds, scores)
+
+    # PDF report output
+    if args.pdf:
+        generate_pdf_report(args.pdf, args.name, args.registry, entry, repo_stats, secret_scan, scores, weights, thresholds)
 
     if args.json:
         overall = overall_from(scores, weights)
