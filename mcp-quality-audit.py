@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
+# mcp_quality_audit.py
 import argparse
+import csv
 import json
 import os
 import re
 import sys
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Tuple
+
 import requests
 from dateutil import parser as dtparser
 from rich.console import Console
@@ -15,71 +18,119 @@ from rich import box
 
 console = Console()
 
+# ------------------ Registry API ------------------
 DEFAULT_REGISTRY = "https://registry.modelcontextprotocol.io"
+API_PREFIX = "/v0"
+PATH_SERVERS = f"{API_PREFIX}/servers"
 
+# ------------------ GitHub API ------------------
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GH_HEADERS = {"Accept": "application/vnd.github+json"}
 if GITHUB_TOKEN:
     GH_HEADERS["Authorization"] = f"Bearer {GITHUB_TOKEN}"
 
-# ---------- Helpers
-
-def get_json(url: str, headers: Optional[Dict[str, str]] = None, timeout=20) -> Optional[dict]:
+# ------------------ HTTP helpers ------------------
+def get_json(url: str, headers: Optional[Dict[str, str]] = None, timeout=20, params: Optional[dict]=None) -> Optional[dict]:
     try:
-        r = requests.get(url, headers=headers, timeout=timeout)
+        r = requests.get(url, headers=headers, timeout=timeout, params=params)
         if r.status_code == 200:
             return r.json()
         return None
     except Exception:
         return None
 
+# ------------------ Registry lookups ------------------
+def _extract_items_and_next(payload: Any) -> Tuple[List[dict], Optional[str]]:
+    """
+    Normalize registry list responses.
+
+    Official example:
+    {
+      "servers": [...],
+      "metadata": {"next_cursor": "abc", "count": 30}
+    }
+    """
+    if not isinstance(payload, dict):
+        return [], None
+    items = payload.get("servers") or payload.get("items") or payload.get("results") or payload.get("data") or []
+    meta = payload.get("metadata") or {}
+    nxt = (
+        meta.get("next_cursor")
+        or meta.get("nextCursor")
+        or payload.get("next_cursor")
+        or payload.get("nextCursor")
+        or payload.get("next")
+    )
+    if isinstance(nxt, str) and nxt.strip() == "":
+        nxt = None
+    return items, nxt
+
 def try_registry_lookup(registry: str, mcp_name: str, fuzzy: bool) -> Tuple[Optional[dict], List[dict]]:
-    """Return (best_match, all_matches)."""
-    all_matches = []
-    # Try exact by ID first (/servers/:id)
-    for path in (f"/servers/{mcp_name}", f"/api/servers/{mcp_name}"):
-        data = get_json(registry.rstrip("/") + path)
-        if isinstance(data, dict) and data:
-            return data, [data]
+    """
+    Use official /v0 endpoints.
+      - Exact: GET /v0/servers/{id}
+      - Fuzzy: GET /v0/servers?search=<query>&limit=50
+    """
+    base = registry.rstrip("/")
+    # exact by ID
+    data = get_json(f"{base}{PATH_SERVERS}/{mcp_name}")
+    if isinstance(data, dict) and data:
+        return data, [data]
 
-    # Fallback search endpoints we often see in registries:
-    candidates = [
-        ("/servers", {"q": mcp_name}),
-        ("/servers", {"query": mcp_name}),
-        ("/api/servers", {"q": mcp_name}),
-        ("/api/servers", {"query": mcp_name}),
-    ]
-    for path, qs in candidates:
-        try:
-            r = requests.get(registry.rstrip("/") + path, params=qs, timeout=20)
-            if r.status_code == 200:
-                j = r.json()
-                if isinstance(j, dict) and "items" in j:
-                    all_matches = j["items"]
-                elif isinstance(j, list):
-                    all_matches = j
-                break
-        except Exception:
-            pass
-
-    # Pick best match by exact name equality if present
+    # fuzzy/search
+    payload = get_json(f"{base}{PATH_SERVERS}", params={"search": mcp_name, "limit": 50})
+    items, _ = _extract_items_and_next(payload)
     best = None
-    if all_matches:
-        # normalize keys we often see
-        def name_of(x):
-            return x.get("name") or x.get("id") or x.get("slug") or x.get("full_name")
-        # exact
-        for x in all_matches:
-            if name_of(x) == mcp_name:
-                best = x
-                break
-        # fuzzy top
-        if fuzzy and not best:
-            best = all_matches[0]
-    return best, all_matches
 
+    def name_of(x):
+        return x.get("name") or x.get("id") or x.get("slug") or x.get("full_name")
+
+    for x in items:
+        if name_of(x) == mcp_name:
+            best = x
+            break
+    if fuzzy and not best and items:
+        best = items[0]
+    return best, items or []
+
+def list_all_servers(registry: str, limit: int = 200, page_size: int = 100) -> List[dict]:
+    """
+    Cursor-based enumeration of /v0/servers.
+      - limit: max total items to return
+      - page_size: 'limit' query param per page (max 100)
+    """
+    base = registry.rstrip("/")
+    results: List[dict] = []
+    cursor = None
+
+    while len(results) < limit:
+        params = {"limit": min(page_size, 100)}
+        if cursor:
+            params["cursor"] = cursor
+        payload = get_json(f"{base}{PATH_SERVERS}", params=params)
+        items, cursor = _extract_items_and_next(payload)
+        if not items:
+            break
+        results.extend(items)
+        if not cursor:
+            break
+
+    return results[:limit]
+
+def filter_servers(servers: List[dict], query: Optional[str]) -> List[dict]:
+    if not query:
+        return servers
+    q = query.lower()
+    def blob(s: dict) -> str:
+        parts = [
+            s.get("name"), s.get("id"), s.get("namespace"),
+            s.get("description"), s.get("publisher"), s.get("owner")
+        ]
+        return " ".join([str(p) for p in parts if p])
+    return [s for s in servers if q in blob(s).lower()]
+
+# ------------------ Repo utilities ------------------
 def extract_repo_url(entry: dict) -> Optional[str]:
-    # common locations for repo links across registries
     for k in ("repo", "repository", "github", "source", "homepage", "url", "website"):
         v = entry.get(k)
         if isinstance(v, str) and "github.com" in v:
@@ -88,12 +139,10 @@ def extract_repo_url(entry: dict) -> Optional[str]:
             for vv in v.values():
                 if isinstance(vv, str) and "github.com" in vv:
                     return vv
-    # deep metadata
     meta = entry.get("_meta") or entry.get("metadata") or {}
-    for k, v in meta.items():
+    for _, v in (meta.items() if isinstance(meta, dict) else []):
         if isinstance(v, str) and "github.com" in v:
             return v
-    # sometimes inside package refs
     pkgs = entry.get("packages") or []
     for p in pkgs:
         src = p.get("source") or p.get("url")
@@ -105,7 +154,7 @@ def gh_api(path: str) -> Optional[dict]:
     return get_json("https://api.github.com" + path, headers=GH_HEADERS)
 
 def parse_github_owner_repo(url: str) -> Optional[Tuple[str, str]]:
-    m = re.search(r"github\.com/([^/]+)/([^/#]+)", url)
+    m = re.search(r"github\.com/([^/]+)/([^/#]+)", url or "")
     if not m:
         return None
     return m.group(1), m.group(2).replace(".git", "")
@@ -127,25 +176,18 @@ def github_repo_stats(repo_url: str) -> Dict[str, Any]:
     out["disabled"] = repo_data.get("disabled")
     out["homepage"] = repo_data.get("homepage")
 
-    # org verification (publisher trust)
     owner_data = gh_api(f"/users/{owner}") or {}
     out["owner_type"] = owner_data.get("type")
-    # For orgs, try to see if they look "verified": there isn't a simple flag via REST,
-    # but many verified orgs have a non-null "is_verified" in GraphQL; we approximate via "is_verified" key if present.
     out["org_is_verified_guess"] = owner_data.get("is_verified")
 
-    # advisories and security issues (best effort)
-    # Search issues with "security" keyword
     issues = gh_api(f"/search/issues?q=repo:{owner}/{repo}+security+in:title,body") or {}
     out["security_issue_hits"] = issues.get("total_count")
 
-    # recent commits for update frequency
     commits = gh_api(f"/repos/{owner}/{repo}/commits")
     if isinstance(commits, list) and commits:
         latest = commits[0].get("commit", {}).get("committer", {}).get("date")
         out["latest_commit"] = latest
 
-    # pull README for GDPR keywords
     readme = gh_api(f"/repos/{owner}/{repo}/readme")
     if readme and "download_url" in readme:
         try:
@@ -176,8 +218,9 @@ def shallow_secret_scan(repo_url: str, limit_files=50) -> Dict[str, Any]:
     if not tree or "tree" not in tree:
         return out
     files = [t for t in tree["tree"] if t.get("type") == "blob"]
-    # sample first N text-like files
-    sample = [f for f in files if not f["path"].lower().endswith((".png",".jpg",".jpeg",".gif",".pdf",".zip",".gz",".jar",".exe",".dll"))][:limit_files]
+    sample = [f for f in files if not f["path"].lower().endswith((
+        ".png",".jpg",".jpeg",".gif",".pdf",".zip",".gz",".jar",".exe",".dll",".webp",".svg"
+    ))][:limit_files]
     for f in sample:
         blob = gh_api(f"/repos/{owner}/{repo}/contents/{f['path']}")
         if not blob or "download_url" not in blob:
@@ -192,27 +235,17 @@ def shallow_secret_scan(repo_url: str, limit_files=50) -> Dict[str, Any]:
                 out["hits"].append({"path": f["path"], "pattern": pat})
     return out
 
+# ------------------ Scoring / reporting ------------------
 def calc_scores(entry: dict, repo_stats: Dict[str, Any], secret_scan: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Produce per-dimension scores (0-100) and a weighted overall.
-    Weights can be tweaked to your policy.
-    """
     scores = {}
 
-    # Publisher trust (verification + org signals)
-    verified = False
     ns = entry.get("namespace") or entry.get("name") or entry.get("id") or ""
-    # Registry FAQ: namespaces are verified via DNS or GitHub. We infer via presence of a domain-backed namespace or io.github.*. (Manual proof would be a field; many registries expose `verified`.)
     explicit_verified = entry.get("verified") or entry.get("publisher_verified") or entry.get("is_verified")
-    if explicit_verified:
-        verified = True
-    elif ns.startswith("io.github.") or re.match(r"([a-z0-9-]+\.)+[a-z]{2,}/", ns):
-        verified = True  # heuristic
+    verified = bool(explicit_verified) or ns.startswith("io.github.") or re.match(r"([a-z0-9-]+\.)+[a-z]{2,}/", ns)
     org_verified = True if repo_stats.get("org_is_verified_guess") else False
     pub_score = 70 + (15 if verified else 0) + (15 if org_verified else 0)
     scores["publisher_trust"] = min(pub_score, 100)
 
-    # Security posture (advisories, secret-scan hits)
     sec_hits = int(repo_stats.get("security_issue_hits") or 0)
     secret_hits = len(secret_scan.get("hits") or [])
     sec_score = 100
@@ -226,7 +259,6 @@ def calc_scores(entry: dict, repo_stats: Dict[str, Any], secret_scan: Dict[str, 
         sec_score = max(sec_score - 50, 10)
     scores["security_posture"] = max(min(sec_score, 100), 0)
 
-    # Maintenance / updates
     latest = repo_stats.get("latest_commit") or repo_stats.get("pushed_at") or repo_stats.get("updated_at")
     maint_score = 50
     if latest:
@@ -247,23 +279,20 @@ def calc_scores(entry: dict, repo_stats: Dict[str, Any], secret_scan: Dict[str, 
             pass
     scores["maintenance"] = maint_score
 
-    # License compliance
     lic = (repo_stats.get("license") or "").upper()
     if lic in {"MIT","APACHE-2.0","BSD-2-CLAUSE","BSD-3-CLAUSE","MPL-2.0"}:
         lic_score = 100
     elif lic in {"GPL-3.0","AGPL-3.0","LGPL-3.0"}:
-        lic_score = 75   # compatible depending on org policy
+        lic_score = 75
     elif lic:
         lic_score = 70
     else:
         lic_score = 40
     scores["license"] = lic_score
 
-    # Privacy/GDPR (signal only)
     gdpr = bool(repo_stats.get("gdpr_mentions"))
     scores["privacy_signal"] = 85 if gdpr else 60
 
-    # Overall (weights)
     overall = (
         0.30 * scores["publisher_trust"] +
         0.30 * scores["security_posture"] +
@@ -278,20 +307,22 @@ def bool_emoji(v: Optional[bool]) -> str:
     return "✅" if v else "❓" if v is None else "❌"
 
 def summarize_tools_resources(entry: dict) -> Tuple[List[str], List[str], List[str]]:
-    """Return (tools, resources, risk_notes)."""
     tools = []
     resources = []
     risk = []
-    # server.json shapes typically include 'tools', 'resources', 'prompts', 'env'
     for k in ("tools", "capabilities", "operations"):
         t = entry.get(k) or []
-        if isinstance(t, dict):  # sometimes grouped by type
+        if isinstance(t, dict):
             for group, arr in t.items():
                 if isinstance(arr, list):
-                    for i in arr: tools.append(i.get("name") or group)
+                    for i in arr:
+                        tools.append(i.get("name") or i.get("title") or group)
         elif isinstance(t, list):
             for i in t:
-                tools.append(i.get("name") or i.get("title") or str(i))
+                if isinstance(i, dict):
+                    tools.append(i.get("name") or i.get("title") or str(i))
+                else:
+                    tools.append(str(i))
 
     r = entry.get("resources") or []
     if isinstance(r, list):
@@ -303,7 +334,6 @@ def summarize_tools_resources(entry: dict) -> Tuple[List[str], List[str], List[s
                 for j in i:
                     resources.append(j.get("name") or j.get("title") or str(j))
 
-    # heuristic risks
     text_blob = json.dumps(entry).lower()
     if "http://" in text_blob or "https://" in text_blob:
         risk.append("External network calls likely")
@@ -314,7 +344,6 @@ def summarize_tools_resources(entry: dict) -> Tuple[List[str], List[str], List[s
 def print_report(mcp_name: str, registry: str, entry: dict, repo_stats: Dict[str, Any], secret_scan: Dict[str, Any], scores: Dict[str, Any]):
     console.print(Panel.fit(f"[bold]MCP Quality Assessment[/bold]\n[dim]{mcp_name}[/dim]\nRegistry: {registry}", border_style="cyan", box=box.ROUNDED))
 
-    # Basic facts
     t = Table(title="Registry Entry", box=box.SIMPLE_HEAVY)
     t.add_column("Field"); t.add_column("Value")
     for k in ("name","id","namespace","version","description","publisher","homepage","website"):
@@ -323,10 +352,9 @@ def print_report(mcp_name: str, registry: str, entry: dict, repo_stats: Dict[str
             t.add_row(k, str(v))
     console.print(t)
 
-    # Publisher trust
     ns = entry.get("namespace") or entry.get("name") or entry.get("id") or ""
     explicit_verified = entry.get("verified") or entry.get("publisher_verified") or entry.get("is_verified")
-    likely_verified = explicit_verified or ns.startswith("io.github.") or re.match(r"([a-z0-9-]+\.)+[a-z]{2,}/", ns) is not None
+    likely_verified = bool(explicit_verified) or ns.startswith("io.github.") or re.match(r"([a-z0-9-]+\.)+[a-z]{2,}/", ns) is not None
 
     t = Table(title="Publisher Trust", box=box.SIMPLE_HEAVY)
     t.add_column("Check"); t.add_column("Result")
@@ -337,7 +365,6 @@ def print_report(mcp_name: str, registry: str, entry: dict, repo_stats: Dict[str
     t.add_row("GitHub org verified (approx.)", str(repo_stats.get("org_is_verified_guess")))
     console.print(t)
 
-    # Tools & resources
     tools, resources, risk = summarize_tools_resources(entry)
     t = Table(title="Declared Capabilities", box=box.SIMPLE_HEAVY)
     t.add_column("Type"); t.add_column("Items")
@@ -347,7 +374,6 @@ def print_report(mcp_name: str, registry: str, entry: dict, repo_stats: Dict[str
         t.add_row("Risk Notes", " | ".join(risk))
     console.print(t)
 
-    # Repo stats & security
     if repo_stats.get("repo_url"):
         t = Table(title="Repository & Security", box=box.SIMPLE_HEAVY)
         t.add_column("Metric"); t.add_column("Value")
@@ -364,22 +390,20 @@ def print_report(mcp_name: str, registry: str, entry: dict, repo_stats: Dict[str
                 subt.add_row(h["path"], h["pattern"])
             console.print(subt)
 
-    # Scores
     st = Table(title="Scores (0–100)", box=box.SIMPLE_HEAVY)
     st.add_column("Dimension"); st.add_column("Score")
     for k in ("publisher_trust","security_posture","maintenance","license","privacy_signal","overall"):
         st.add_row(k, str(scores[k]))
     console.print(st)
 
-    # Manual review checklist
     checklist = [
-        ("Permissions & scopes alignment", "MCP servers don’t request runtime scopes like extensions; review tools/resources and any required env vars."),
-        ("Test in non-prod", "Run server in a sandboxed host; monitor latency and side-effects."),
-        ("GDPR compliance", "Confirm if personal data is processed; obtain a DPA where applicable."),
-        ("Data residency", "Verify storage/processing locations; prefer EU or SCCs in place."),
-        ("Privacy policy", "Locate and review publisher’s policy for collection/usage/sharing."),
-        ("Support options", "Docs, discussion forum, issue response times, security contact."),
-        ("DR/rollback", "Plan rollback if server breaks workflows."),
+        ("Permissions & scopes alignment", "Review tools/resources and any required env vars (MCP has no runtime scopes)."),
+        ("Test in non-prod", "Run server in sandbox; monitor latency/side-effects."),
+        ("GDPR compliance", "Confirm personal data processing; DPA if needed."),
+        ("Data residency", "Verify storage/processing locations."),
+        ("Privacy policy", "Locate and review publisher’s policy."),
+        ("Support options", "Docs, forums, issue responsiveness, security contact."),
+        ("DR/rollback", "Have a rollback plan if workflows break."),
     ]
     ct = Table(title="Manual Review Needed", box=box.SIMPLE_HEAVY)
     ct.add_column("Item"); ct.add_column("Action")
@@ -387,13 +411,79 @@ def print_report(mcp_name: str, registry: str, entry: dict, repo_stats: Dict[str
         ct.add_row(a,b)
     console.print(ct)
 
+def print_server_list(servers: List[dict], json_out: bool = False):
+    if json_out:
+        print(json.dumps(servers, indent=2))
+        return
+    t = Table(title=f"Registry Servers ({len(servers)})", box=box.SIMPLE_HEAVY)
+    t.add_column("Name/ID", overflow="fold")
+    t.add_column("Namespace", overflow="fold")
+    t.add_column("Version", justify="right")
+    t.add_column("Publisher", overflow="fold")
+    t.add_column("Repo", overflow="fold")
+    for s in servers:
+        name = s.get("name") or s.get("id") or s.get("slug") or ""
+        ns = s.get("namespace") or ""
+        ver = s.get("version") or ""
+        pub = (s.get("publisher") or s.get("owner") or "")
+        repo = extract_repo_url(s) or ""
+        t.add_row(str(name), str(ns), str(ver), str(pub), str(repo))
+    console.print(t)
+
+def export_csv(servers: List[dict], path: str):
+    """Write a CSV with lightweight registry fields (no GitHub calls)."""
+    cols = ["name_or_id", "namespace", "version", "publisher", "repo", "verified"]
+    close_file = True
+    if path == "-":
+        f = sys.stdout
+        close_file = False
+    else:
+        f = open(path, "w", newline="", encoding="utf-8")
+    try:
+        writer = csv.writer(f)
+        writer.writerow(cols)
+        for s in servers:
+            name = s.get("name") or s.get("id") or s.get("slug") or ""
+            ns = s.get("namespace") or ""
+            ver = s.get("version") or ""
+            pub = (s.get("publisher") or s.get("owner") or "")
+            repo = extract_repo_url(s) or ""
+            verified = s.get("verified") or s.get("publisher_verified") or s.get("is_verified") or ""
+            writer.writerow([name, ns, ver, pub, repo, verified])
+    finally:
+        if close_file:
+            f.close()
+
+# ------------------ CLI ------------------
 def main():
     ap = argparse.ArgumentParser(description="MCP quality audit from registry + GitHub signals")
-    ap.add_argument("name", help="MCP name (e.g., com.example/my-mcp). Use --fuzzy to search by keyword.")
+    ap.add_argument("name", nargs="?", help="MCP name (e.g., com.example/my-mcp). Use --fuzzy to search by keyword.")
     ap.add_argument("--registry", default=DEFAULT_REGISTRY, help="MCP registry base URL")
     ap.add_argument("--fuzzy", action="store_true", help="Search instead of exact lookup")
-    ap.add_argument("--json", action="store_true", help="Output machine-readable JSON in addition to rich report")
+    ap.add_argument("--json", action="store_true", help="Output machine-readable JSON")
+    ap.add_argument("--list", action="store_true", help="List MCP servers and exit")
+    ap.add_argument("--limit", type=int, default=200, help="Max number of servers to list with --list (default: 200)")
+    ap.add_argument("--page-size", type=int, default=100, help="Per-page limit for registry calls (max 100)")
+    ap.add_argument("--search", type=str, default=None, help="Filter listed servers by keyword")
+    ap.add_argument("--csv", type=str, default=None, help="CSV output path (use '-' for stdout) when used with --list")
     args = ap.parse_args()
+
+    # Handle --list first
+    if args.list:
+        servers = list_all_servers(args.registry, limit=args.limit, page_size=args.page_size)
+        servers = filter_servers(servers, args.search)
+        if not servers:
+            console.print(f"[red]No servers found at {args.registry}[/red]")
+            sys.exit(2)
+        if args.csv:
+            export_csv(servers, args.csv)
+        else:
+            print_server_list(servers, json_out=args.json)
+        sys.exit(0)
+
+    if not args.name:
+        console.print("[red]Please provide a server name (or use --list).[/red]")
+        sys.exit(2)
 
     entry, matches = try_registry_lookup(args.registry, args.name, args.fuzzy)
     if not entry:
