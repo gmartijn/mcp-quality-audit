@@ -19,7 +19,7 @@
 
 It’s designed to help you do **quick due diligence**, not to replace your security team (hi security team, please don’t @ me).
 
-> Curious how the score is calculated? See **[CALCULATION.md](./CALCULATION.md)** for the full, spicy breakdown.
+> Curious how the score is calculated? See **[CALCULATION.md](https://github.com/gmartijn/mcp-quality-audit/blob/main/calculation.md))** for the full, spicy breakdown.
 
 ---
 
@@ -101,7 +101,7 @@ python mcp_quality_audit.py filesystem --fuzzy --skipssl
 - We score five areas (0–100): `publisher_trust`, `security_posture`, `maintenance`, `license`, `privacy_signal`.
 - We combine them with weights (defaults: `0.30, 0.30, 0.25, 0.10, 0.05`).
 - That yields an **overall score** (0–100), which maps to a **risk label**.
-- Want the full story? **[Read CALCULATION.md](./CALCULATION.md)** — it’s funny *and* educational.
+- Want the full story? **[Read CALCULATION.md](https://github.com/gmartijn/mcp-quality-audit/blob/main/calculation.md)** — it’s funny *and* educational.
 
 ### Customize the knobs
 ```bash
