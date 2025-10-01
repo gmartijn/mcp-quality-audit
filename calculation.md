@@ -5,19 +5,19 @@
 
 ---
 
-## TL;DR (for busy humans and thirsty cacti)
+## TL;DR (for busy humans and caffeinated raccoons)
 We grade an MCP server on **five things** (0–100 each), mix them with **weights**, get an **overall score**, then translate that into a **risk rating**:  
-**Very Low → Low → Medium → High → Critical**.  
-High score = chill. Low score = nope.
+**Low → Medium → High → Critical**.  
+High score = relax. Low score = maybe hide under your desk.
 
 ---
 
 ## The Five Ingredients (chef’s kiss)
 1. **Publisher Trust** — Does the namespace look verified and does the GitHub org seem like real adults are in charge?
-2. **Security Posture** — Any “security/CVE” drama in issues? Any *oopsie* secrets in code? (We do a small regex sniff. We’re nosy, not creepy.)
-3. **Maintenance** — When was the last commit? Fresh code is like fresh bread: smells better and grows less mold.
-4. **License** — MIT/Apache/BSD/MPL: ⭐⭐⭐⭐⭐. GPL/AGPL/LGPL: “depends on policy.” Unknown license: side‑eye.
-5. **Privacy Signal** — Do docs even whisper “privacy”, “GDPR”, or “EU data”? It’s a hint, not legal advice. (We’re a script, not your lawyer.)
+2. **Security Posture** — Any “security/CVE” drama in issues? Any *oopsie* secrets in code? (We do a regex sniff. Nosy, not creepy.)
+3. **Maintenance** — When was the last commit? Are there real humans contributing? Fresh repos smell like fresh bread.
+4. **License** — MIT/Apache/BSD/MPL: ⭐⭐⭐⭐⭐. GPL/AGPL/LGPL: “depends on policy.” No license: side-eye and a sigh.
+5. **Privacy Signal** — README mentions “privacy”, “GDPR”, or “EU data”? Homepage links a privacy policy? It’s a vibe check, not legal advice. (We’re a script, not your lawyer.)
 
 Each gets a score from **0–100**. We don’t argue with you; we just judge silently.
 
@@ -32,7 +32,7 @@ maintenance      : 0.25
 license          : 0.10
 privacy_signal   : 0.05
 ```
-If yours don’t add up to 1.0, we **normalize** them. (Think of it as refilling the pot so your cactus doesn’t tip over.)
+If yours don’t add up to 1.0, we **normalize** them. (Think of it as topping up your coffee until the cup is full again.)
 
 Change them any time:
 ```bash
@@ -43,7 +43,7 @@ Change them any time:
 
 ---
 
-## The Math (nothing up our sleeves)
+## The Math (abracadabra, but with decimals)
 We do a **weighted average**, then round to one decimal:
 
 ```
@@ -54,34 +54,33 @@ overall = 0.30*publisher_trust
         + 0.05*privacy_signal
 ```
 
-That’s it. No secret blockchain. No AI deciding your horoscope. Just polite arithmetic.
+That’s it. No neural networks, no dice rolls. Just arithmetic with a side of sass.
 
 ---
 
-## Risk Rating (what you actually wanted)
-We map the **overall** score → a label using **thresholds** (defaults below). We pick the **highest** label whose minimum ≤ score.
+## Risk Rating (the rainbow of nope)
+We map the **overall** score → a label using **thresholds** (defaults below).  
+We pick the **highest** label whose minimum ≤ score.
 
 ```
-very_low : 90
 low      : 75
 medium   : 60
 high     : 40
 critical : 0
 ```
 
-Tweak them to suit your appetite for chaos:
+Tweak them to match your risk appetite:
 ```bash
---risk-thresholds '{"very_low":92,"low":80,"medium":65,"high":45,"critical":0}'
+--risk-thresholds '{"low":80,"medium":65,"high":45,"critical":0}'
 # or
 --risk-thresholds-file thresholds.json
 ```
 
 **Translations for humans:**
-- **Very Low** — Go ahead. Deploy it. Name your pipeline “YOLO” if you must.
-- **Low** — Sensible. Maybe wear a helmet in staging.
-- **Medium** — Reasonable people could disagree. Add logging. Add snacks.
-- **High** — Proceed only if you enjoy whack‑a‑mole.
-- **Critical** — Put it down. Back away. Unplug the keyboard.
+- **Low** — Deploy with joy. Maybe even whistle.
+- **Medium** — Add logging, snacks, and maybe a contingency plan.
+- **High** — You’re living dangerously. Expect pager alerts at 3 a.m.
+- **Critical** — Put it down. Back away slowly. Make the sign of the cross with your keyboard.
 
 ---
 
@@ -98,32 +97,44 @@ Weights: 0.30, 0.30, 0.25, 0.10, 0.05
 Total = 74.25 → rating “Medium”
 ```
 
-Is it perfect? No. Is it useful? Absolutely. Like duct tape, but for governance.
+Useful? Yes. Perfect? No. Like duct tape, but for governance.
 
 ---
 
 ## What’s Automated vs. “Please Use Your Brain”
-- ✅ Automated: registry lookups, basic GitHub stats, best‑effort security keyword search, light secret sniff, README keyword check.
-- 🧠 Manual sanity: actual GDPR compliance, data residency guarantees, permissions review, and whether deploying this will make the on‑call cry.
+- ✅ Automated: registry lookups, GitHub stats, security keyword search, secret sniff, README keyword check, license parsing.
+- 🧠 Manual sanity: actual GDPR compliance, data residency guarantees, permissions alignment, and whether deploying this will make your on-call cry.
 
 Pro tip: **Test in staging.** If it explodes, that’s a data point.
 
 ---
 
-## FAQ (Frequently Asked Quibbles)
+## Step-by-Step Explainability
+If you run with `--explain-risk`, you get:
+- Per-dimension breakdowns (how each score was built, deltas, caps, penalties).
+- Weighted contribution table (see which dimension carried you).
+- Threshold mapping (why you ended up Medium instead of Low).
+
+Basically: math receipts you can wave in meetings.
+
+---
+
+## FAQ (Frequently Argued Quibbles)
 **Q. Can I game the score?**  
-A. You can try. But if you push secrets to GitHub, the regex goblins will find them.
+A. You can try. But if you push secrets to GitHub, the regex goblins will find them. Again.
 
 **Q. Why is privacy only 5%?**  
-A. Because signals are weak without contracts. Want it higher? Bump the weight. Be the change you want to audit.
+A. Because signals are weak without contracts. Want it higher? Bump the weight. Audit like you mean it.
 
 **Q. The score is 74.9 and says Medium. I demand Low.**  
-A. Adjust thresholds or ship better software. Preferably both.
+A. Either adjust thresholds… or ship better code. Preferably both.
 
-**Q. Is this a replacement for security review?**  
-A. No. It’s an **early warning system** with good bedside manner.
+**Q. Is this a replacement for a security review?**  
+A. No. This is the early warning intern. Your security team is still the adult in the room.
 
 ---
 
 ## Final Word
-This file contains **feelings about math**. Use it to prioritize work and guide conversations, not to end them. May your pipelines be green and your secrets be `.gitignored`.
+This file contains **feelings about math**.  
+Use it to prioritize and guide conversations, not to end them.  
+May your pipelines be green and your secrets forever `.gitignored`.  
