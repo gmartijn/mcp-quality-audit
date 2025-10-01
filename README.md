@@ -79,7 +79,7 @@ We take **five scores (0–100)**, multiply by weights, sum them up, and call it
 Then we map that score to a label using thresholds.  
 
 **Curious about how this works?**  
-See [CALCULATION.md](CALCULATION.md) — it’s like the director’s cut of the math, complete with sarcasm.  
+See [CALCULATION.md]([CALCULATION.md](https://github.com/gmartijn/mcp-quality-audit/blob/main/calculation.md)) — it’s like the director’s cut of the math, complete with sarcasm.  
 
 ---
 
