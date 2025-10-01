@@ -6,147 +6,91 @@
 ---
 
 ## What is this?
-`mcp_quality_audit.py` is a command‑line tool that:
+`mcp_quality_audit.py` is a command-line tool that:
 - Talks to the **official MCP Registry** (`/v0/servers`) to discover servers
-- Peeks at linked **GitHub repos** for vibes data (license, commits, issues)
-- Does a **light secret sniff** (no shame, just regex)
-- Rolls everything up into a **quality score** *and* a **risk rating**
-  - 🟢 “Very Low”
-  - 🟡 “Low”
-  - 🟠 “Medium”
-  - 🟧 “High”
-  - 🔴 “Critical”
+- Peeks at linked **GitHub repos** for signals (license, activity, issues, security bits)
+- Does a **light secret sniff** (regex only; no cloning)
+- Rolls everything up into a **quality score** *and* a **risk rating** on a 4-level scale:
+  - 🟢 **Low**
+  - 🟡 **Medium**
+  - 🟠 **High**
+  - 🔴 **Critical**
 
-It’s designed to help you do **quick due diligence**, not to replace your security team (hi security team, please don’t @ me).
-
-> Curious how the score is calculated? See **[CALCULATION.md](./CALCULATION.md)** for the full, spicy breakdown.
+It’s designed for **quick due diligence**, not to replace your security team (hi security team, please don’t @ me).
 
 ---
 
-## Features (now with 17% extra sass)
-- `--list` — Enumerate servers from the MCP Registry (cursor‑based pagination)
-- `--search "<query>"` — Filter server list by keyword
+## Features (now with explainable receipts)
+- `--list` — Enumerate servers from the MCP Registry (cursor-aware)
+- `--search "<query>"` — Filter listed servers by keyword
 - `--csv <path|- >` — Export a tidy CSV for spreadsheets and/or questionable pivot tables
-- `--page-size` & `--limit` — You get a page size! You get a page size! Everyone gets a page size!
-- **Single‑server audit** with **evidence‑based** signals:
-  - Publisher trust (namespace + GitHub org hints)
-  - Security posture (security issue hits + secret smells)
-  - Maintenance (freshness of commits)
-  - License sanity check
-  - Privacy/GDPR *vibes* (keyword hints in README)
+- `--page-size` & `--limit` — Control registry pagination
+- **Single-server audit** with evidence-based signals:
+  - **Publisher trust** (namespace hints, registry flags, GitHub owner/org data)
+  - **Security posture** (security keyword hits, optional SBOM/dependabot signals, optional secret scan)
+  - **Maintenance** (freshness of commits + active devs in last 90 days)
+  - **License** sanity check (SPDX)
+  - **Privacy/GDPR** *vibes* (README hints)
 - **Configurable scoring** via `--weights` / `--weights-file`
 - **Configurable risk thresholds** via `--risk-thresholds` / `--risk-thresholds-file`
-- **Proxy‑friendly networking** via `--skipssl` (skip TLS verification when your corporate proxy does SSL inspection)
-- Pretty terminal output via `rich` **and** `--json` for machines that don’t appreciate dramatic tables
-
----
-
----
+- **Explainable risk** via `--explain-risk` (step-by-step tables of how the number happened)
+- **Optional PDF report** via `--pdf path.pdf` (pretty summary + heatmap)
+- **Networking options**
+  - `--skipssl` for environments with SSL-inspecting proxies (be careful)
+- **GitHub options**
+  - `--no-deps` to skip dependency graph + Dependabot lookups
+  - `--max-commits` to cap signed-commit sampling
+  - `--no-secret-scan` to skip shallow regex scanning
 
 ---
 
 ## Example Output
 
-Here’s a real-world run using **`io.github.p1va/symbols`** (colors trimmed for Markdown).
-
-```text
+### Human-friendly terminal report
+```
 ╭────────────────────────────────────────────────────╮
 │ MCP Quality Assessment                             │
-│ io.github.p1va/symbols                             │
+│ com.example/my-mcp                                 │
 │ Registry: https://registry.modelcontextprotocol.io │
-│ Risk Rating: Low  •  Score: 86.2/100               │
+│ Risk Rating: Medium  •  Score: 72.4/100            │
 ╰────────────────────────────────────────────────────╯
-                                Registry Entry                                 
-                                                                               
-  Field         Value                                                          
- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 
-  name          io.github.p1va/symbols                                         
-  version       0.0.12                                                         
-  description   MCP server to read, inspect and troubleshoot codebase symbols  
-                                                                               
-                 Publisher Trust                  
-                                                  
-  Check                                   Result  
- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 
-  Namespace looks verified (DNS/GitHub)   ✅      
-  Registry 'verified' flag                None    
-  GitHub owner type                       User    
-  GitHub org verified (approx.)           None    
-                                                  
-            Declared Capabilities             
-                                              
-  Type         Items                          
- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 
-  Tools                                       
-  Resources                                   
-  Risk Notes   External network calls likely  
-                                              
-                  Repository & Security                  
-                                                         
-  Metric                Value                            
- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 
-  repo_url              https://github.com/p1va/symbols  
-  stars                 0                                
-  forks                 0                                
-  open_issues           0                                
-  latest_commit         2025-09-17T14:14:22Z             
-  pushed_at             2025-09-17T14:14:27Z             
-  archived              False                            
-  disabled              False                            
-  homepage                                               
-  security_issue_hits   0                                
-  Secret scan hits      0                                
-                                                         
-           Scores (0–100)            
-                                     
-  Dimension          Score   Weight  
- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 
-  publisher_trust    85      0.30    
-  security_posture   100     0.30    
-  maintenance        95      0.25    
-  license            40      0.10    
-  privacy_signal     60      0.05    
-  overall            86.2    —       
-                                     
-  Risk Thresholds (min  
-     score → label)     
-                        
-  Label      Min Score  
- ━━━━━━━━━━━━━━━━━━━━━━ 
-  Very Low   90         
-  Low        75         
-  Medium     60         
-  High       40         
-  Critical   0          
-                        
-                                               Manual Review Needed                                               
-                                                                                                                  
-  Item                             Action                                                                         
- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 
-  Permissions & scopes alignment   Review tools/resources and any required env vars (MCP has no runtime scopes).  
-  Test in non-prod                 Run server in sandbox; monitor latency/side-effects.                           
-  GDPR compliance                  Confirm personal data processing; DPA if needed.                               
-  Data residency                   Verify storage/processing locations.                                           
-  Privacy policy                   Locate and review publisher’s policy.                                          
-  Support options                  Docs, forums, issue responsiveness, security contact.                          
-  DR/rollback                      Have a rollback plan if workflows break.                                       
+...
 ```
 
+### Explainable risk mode
+```
+python mcp_quality_audit.py com.example/my-mcp --explain-risk
+```
+Shows a **step-by-step breakdown** for each dimension.
+
+### PDF report (optional)
+```
+python mcp_quality_audit.py com.example/my-mcp --pdf report.pdf
+```
+
+---
+
 ## Installation
-## Installation
+
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-> Minimal `requirements.txt`:
-> ```txt
-> requests
-> python-dateutil
-> rich
-> ```
+**Minimal `requirements.txt`:**
+```txt
+requests
+urllib3
+python-dateutil
+rich
+```
 
-Optional but recommended (for kinder GitHub API rate limits):
+**Optional (for PDF reports):**
+```txt
+matplotlib
+```
+
+**GitHub rate limits will love you if you set a token:**
 ```bash
 export GITHUB_TOKEN=ghp_yourTokenGoesHere
 ```
@@ -155,16 +99,14 @@ export GITHUB_TOKEN=ghp_yourTokenGoesHere
 
 ## Quickstart
 
-### 1) List some servers
+### 1) List servers
 ```bash
 python mcp_quality_audit.py --list --limit 20
 ```
 
-### 2) Search and CSV it
+### 2) Search + CSV export
 ```bash
 python mcp_quality_audit.py --list --search git --csv servers.csv
-# or dump CSV to stdout:
-python mcp_quality_audit.py --list --csv - | head
 ```
 
 ### 3) Audit a specific MCP (fuzzy search FTW)
@@ -172,69 +114,41 @@ python mcp_quality_audit.py --list --csv - | head
 python mcp_quality_audit.py filesystem --fuzzy
 ```
 
-### 4) Machine‑readable output
+### 4) Machine-readable JSON
 ```bash
 python mcp_quality_audit.py fetch --fuzzy --json > fetch_audit.json
 ```
 
-### 5) Behind a proxy that does SSL inspection?
+### 5) PDF report
 ```bash
-# Disable TLS verification for all HTTP(S) calls this script makes
-python mcp_quality_audit.py --list --skipssl
-
-# Fuzzy audit + skip SSL verification
-python mcp_quality_audit.py filesystem --fuzzy --skipssl
-```
-> ⚠️ **Safety note:** `--skipssl` disables certificate verification. Only use it in a trusted network (e.g., corporate proxy with SSL inspection). If you can, prefer installing your proxy’s root CA so you don’t need this flag.
-
----
-
-## Scoring & Risk Rating (the tiny version)
-- We score five areas (0–100): `publisher_trust`, `security_posture`, `maintenance`, `license`, `privacy_signal`.
-- We combine them with weights (defaults: `0.30, 0.30, 0.25, 0.10, 0.05`).
-- That yields an **overall score** (0–100), which maps to a **risk label**.
-- Want the full story? **[Read CALCULATION.md](./CALCULATION.md)** — it’s funny *and* educational.
-
-### Customize the knobs
-```bash
-# Adjust weights (normalized if they don't sum to 1)
-python mcp_quality_audit.py filesystem --fuzzy \
-  --weights '{"publisher_trust":0.25,"security_posture":0.35,"maintenance":0.25,"license":0.10,"privacy_signal":0.05}'
-
-# Adjust thresholds (min score for each label)
-python mcp_quality_audit.py fetch --fuzzy \
-  --risk-thresholds '{"very_low":90,"low":75,"medium":60,"high":40,"critical":0}'
+python mcp_quality_audit.py com.example/my-mcp --pdf audit.pdf
 ```
 
 ---
 
-## Exit Codes (so your CI can judge harshly)
-- `0` — Success / results found
-- `2` — No results / input error / registry said “nope”
+## Scoring & Risk (the tiny version)
+
+Scores five dimensions **0–100**:
+- `publisher_trust`
+- `security_posture`
+- `maintenance`
+- `license`
+- `privacy_signal`
+
+Default weights sum to 1.0, thresholds map overall score → risk.
 
 ---
 
-## Tips & Tricks
-- Set `GITHUB_TOKEN` to avoid rate‑limit grumpiness.
-- For big listings: `--limit 1000 --page-size 100`
-- CSV + jq + xsv = ✨ data wrangling magic ✨
-- Think an MCP looks suspicious? **Test in a sandbox.** If it breaks things,
-  congrats: you’ve done science.
-
----
-
-## Contributing
-PRs welcome! Please keep the tone cheeky but professional. If you add a feature,
-consider a flag. (Engineers love flags. We hoard them like dragons.)
+## Exit Codes
+- `0` — Success
+- `2` — No results / input error
 
 ---
 
 ## License
-MIT. (Because life is short and lawyers are expensive.)
+MIT.
 
 ---
 
-## Disclaimer (the serious bit)
-This tool provides **heuristics** and **hints**. It does not constitute a
-security assessment, legal advice, or a promise that the universe will behave.
-Use your organization’s security policies, staging environments, and common sense.
+## Disclaimer
+This tool provides **heuristics** and **hints**. Use your organization’s security policies, staging environments, and common sense.
