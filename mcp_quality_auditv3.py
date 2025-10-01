@@ -9,6 +9,7 @@ import sys
 import random
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, List, Tuple
+from urllib.parse import quote  # ← added for URL-encoding direct lookups
 
 import requests
 import urllib3
@@ -216,22 +217,64 @@ def _extract_items_and_next(payload: Any) -> Tuple[List[dict], Optional[str]]:
     return items if isinstance(items, list) else [], nxt
 
 def try_registry_lookup(registry: str, mcp_name: str, fuzzy: bool) -> Tuple[Optional[dict], List[dict]]:
+    """
+    Enhanced lookup:
+    - URL-encodes direct /servers/{id} fetch so composite names work if supported.
+    - Searches and performs case-insensitive matching against composite forms:
+      namespace/name, namespace.name, namespace:name, and single fields.
+    - Leaves final "one-candidate auto-pick" to the caller (main) so UX is explicit.
+    """
     base = registry.rstrip("/")
-    data = get_json(f"{base}{PATH_SERVERS}/{mcp_name}")
+
+    # Direct lookup with URL-encoding (supports slashes in id if server allows encoded slashes)
+    path_key = quote(mcp_name, safe="")
+    data = get_json(f"{base}{PATH_SERVERS}/{path_key}")
     if isinstance(data, dict) and data:
         return data, [data]
+
+    # Fallback search
     payload = get_json(f"{base}{PATH_SERVERS}", params={"search": mcp_name, "limit": 50})
     items, _ = _extract_items_and_next(payload)
-    best = None
-    def name_of(x):
-        return x.get("name") or x.get("id") or x.get("slug") or x.get("namespace") or x.get("full_name")
-    for x in items:
-        if name_of(x) == mcp_name:
-            best = x
-            break
-    if fuzzy and not best and items:
-        best = items[0]
-    return best, items or []
+
+    def _norm(s: str) -> str:
+        return re.sub(r"[-_\s]+", "-", (s or "").strip().lower())
+
+    def _composites(e: dict) -> set:
+        e = unwrap_entry(e)
+        ns = str(e.get("namespace") or "")
+        nm = str(
+            e.get("name")
+            or e.get("id")
+            or e.get("slug")
+            or e.get("full_name")
+            or e.get("display_name")
+            or e.get("displayName")
+            or ""
+        )
+        ids: List[str] = []
+        if nm:
+            ids.append(nm)
+        if ns and nm:
+            ids.extend([f"{ns}/{nm}", f"{ns}.{nm}", f"{ns}:{nm}"])
+        # include any explicit id-like fields too
+        for k in ("id", "full_name", "fullName"):
+            v = e.get(k)
+            if v:
+                ids.append(str(v))
+        return {_norm(x) for x in ids if x}
+
+    target = _norm(mcp_name)
+
+    # Case-insensitive exact match against any composite form
+    for e in items or []:
+        if target in _composites(e):
+            return e, items or []
+
+    # Fuzzy: keep legacy behavior (pick first)
+    if fuzzy and items:
+        return items[0], items
+
+    return None, items or []
 
 def list_all_servers(registry: str, limit: int = 200, page_size: int = 100) -> List[dict]:
     base = registry.rstrip("/")
@@ -664,12 +707,11 @@ def calc_scores(entry: dict, repo_stats: Dict[str, Any], secret_scan: Dict[str, 
 
     scr = repo_stats.get("signed_commits_ratio")
     if isinstance(scr, (int, float)):
+        add = 0
         if scr >= 0.75:
             sec += 6; add = +6
         elif scr >= 0.5:
             sec += 3; add = +3
-        else:
-            add = 0
         if explain and add:
             explanation["security_posture"]["steps"].append({"reason": "Signed commits ratio", "delta": add, "ratio": round(scr, 3)})
 
@@ -1164,10 +1206,22 @@ def main():
 
     entry, matches = try_registry_lookup(args.registry, args.name, args.fuzzy)
     if not entry:
-        console.print(f"[red]No registry entry found for[/red] {args.name} at {args.registry}")
-        if matches:
-            console.print(f"Found {len(matches)} candidates. Try --fuzzy and a broader query.")
-        sys.exit(2)
+        # If search yielded exactly one candidate, accept it automatically
+        if matches and len(matches) == 1:
+            entry = unwrap_entry(matches[0])
+        else:
+            console.print(f"[red]No registry entry found for[/red] {args.name} at {args.registry}")
+            if matches:
+                # Show friendly suggestions
+                def _label(e):
+                    e = unwrap_entry(e)
+                    ns = e.get("namespace") or ""
+                    nm = e.get("name") or e.get("id") or e.get("slug") or e.get("full_name") or e.get("display_name") or e.get("displayName") or ""
+                    return f"{ns}/{nm}" if ns and nm else (ns or nm or "<?>")
+                suggestions = [_label(m) for m in matches[:5]]
+                console.print("Found candidates:\n  - " + "\n  - ".join(suggestions))
+                console.print("Tip: try one of the names above, add [bold]--fuzzy[/bold], or run [bold]--list --search[/bold].")
+            sys.exit(2)
 
     repo_url = extract_repo_url(entry)
     repo_stats = {}
