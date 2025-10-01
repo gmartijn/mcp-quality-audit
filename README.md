@@ -63,7 +63,7 @@ python mcp_quality_audit.py com.example/my-mcp --explain-risk
 ```
 Shows a **step-by-step breakdown** for each dimension.
 
-### PDF report (optional)
+### PDF report (optional) 
 ```
 python mcp_quality_audit.py com.example/my-mcp --pdf report.pdf
 ```
@@ -146,7 +146,7 @@ Default weights sum to 1.0, thresholds map overall score → risk.
 ---
 
 ## License
-MIT.
+MIT (Because lawyers are expensive ⚖️)
 
 ---
 
