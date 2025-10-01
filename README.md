@@ -63,7 +63,7 @@ python mcp_quality_audit.py com.example/my-mcp --explain-risk
 ```
 Shows a **step-by-step breakdown** for each dimension.
 
-### PDF report (optional) 
+### PDF report (optional)
 ```
 python mcp_quality_audit.py com.example/my-mcp --pdf report.pdf
 ```
@@ -146,9 +146,42 @@ Default weights sum to 1.0, thresholds map overall score → risk.
 ---
 
 ## License
-MIT (Because lawyers are expensive ⚖️)
+MIT.  
+Because life is short, code should be free, and **lawyers are expensive**.
 
 ---
 
 ## Disclaimer
-This tool provides **heuristics** and **hints**. Use your organization’s security policies, staging environments, and common sense.
+This tool provides **heuristics** and **hints**.  
+It does not constitute a security assessment, legal advice, or a guarantee of eternal happiness.  
+Use your organization’s security policies, staging environments, and common sense.  
+(And if in doubt: call your security team. Not your lawyer. See “lawyers are expensive.”)
+
+---
+
+## Hilarious FAQ
+
+**Q: Will this tool guarantee my MCP is safe?**  
+A: Absolutely not. It will, however, guarantee you some smugness when you say, “Well, *our* audit said medium risk.”
+
+**Q: Why does the secret scanner look for AWS keys?**  
+A: Because people keep committing AWS keys. Stop doing that. Please. Jeff Bezos does not need more hobbies.
+
+**Q: Can I use this tool in production?**  
+A: Yes, but also… why would you? Think of it like a metal detector: useful before boarding the plane, not mid-flight.
+
+**Q: Why does it sometimes yell about rate limits?**  
+A: Because GitHub is not your unlimited buffet. Bring a `GITHUB_TOKEN`, tip your API, and pace yourself.
+
+**Q: My score is “critical.” Should I panic?**  
+A: Don’t panic. Unless you like panic. In which case, panic responsibly and write a retro afterwards.
+
+**Q: Why is there a PDF option?**  
+A: Because managers love PDFs. They can’t grep them, but boy do they love stapling them to PowerPoints.
+
+**Q: Does this replace a proper security team?**  
+A: No. This tool is like a snarky intern: it spots obvious problems but should never be put in charge of your firewall.
+
+**Q: Will using this tool make me more attractive?**  
+A: Only to other people who read README files for fun. Which, frankly, is the hottest demographic.
+
